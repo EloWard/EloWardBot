@@ -1,3 +1,4 @@
+require('dotenv').config();
 const irc = require('irc-framework');
 const fetch = require('node-fetch');
 
@@ -12,8 +13,12 @@ class EloWardTwitchBot {
     const token = process.env.TWITCH_TOKEN;
     if (!token) {
       console.error('❌ TWITCH_TOKEN environment variable required');
+      console.error('Make sure .env file exists with TWITCH_TOKEN=oauth:your_token');
       process.exit(1);
     }
+
+    console.log('🚀 Starting EloWard Twitch Bot...');
+    console.log('📡 CF Worker URL:', this.CLOUDFLARE_WORKER_URL);
 
     this.bot.connect({
       host: 'irc.chat.twitch.tv',
@@ -52,7 +57,10 @@ class EloWardTwitchBot {
       });
 
       if (response.ok) {
-        console.log(`✅ Processed message for ${user} in ${channel}`);
+        const result = await response.json();
+        console.log(`✅ Processed message for ${user} in ${channel}:`, result.action);
+      } else {
+        console.error(`❌ CF Worker responded with ${response.status}`);
       }
     } catch (error) {
       console.error(`❌ Error processing message: ${error.message}`);
@@ -61,7 +69,13 @@ class EloWardTwitchBot {
 
   async loadChannelsFromCloudflare() {
     try {
+      console.log('📡 Loading channels from Cloudflare...');
       const response = await fetch(`${this.CLOUDFLARE_WORKER_URL}/channels`);
+      
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+      
       const { channels } = await response.json();
       
       channels.forEach(channel => {
@@ -72,6 +86,10 @@ class EloWardTwitchBot {
       console.log(`✅ Joined ${channels.length} channels:`, channels);
     } catch (error) {
       console.error('❌ Failed to load channels:', error.message);
+      // Fallback: join a test channel
+      console.log('🔄 Falling back to test channel...');
+      this.bot.join('#yomata1');
+      this.channels.add('yomata1');
     }
   }
 }
