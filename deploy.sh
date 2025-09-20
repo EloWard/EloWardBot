@@ -12,7 +12,7 @@ echo "🚀 Deploying EloWard Twitch Bot..."
 ssh -i $SSH_KEY $SERVER_USER@$SERVER_IP "mkdir -p $APP_DIR"
 
 # Copy files to server
-scp -i $SSH_KEY bot.js package.json $SERVER_USER@$SERVER_IP:$APP_DIR/
+scp -i $SSH_KEY bot.js package.json .env $SERVER_USER@$SERVER_IP:$APP_DIR/
 
 # Install dependencies and restart bot
 ssh -i $SSH_KEY $SERVER_USER@$SERVER_IP << 'EOF'

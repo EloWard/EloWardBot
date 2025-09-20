@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node bot.js",
     "deploy": "./deploy.sh",
-    "logs": "pm2 logs eloward-bot"
+    "logs": "pm2 logs elowardbot"
   },
   "dependencies": {
     "irc-framework": "^4.13.0",
