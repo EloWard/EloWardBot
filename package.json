@@ -1,0 +1,15 @@
+{
+  "name": "elowardbot",
+  "version": "1.0.0",
+  "description": "EloWard Twitch Bot",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "deploy": "./deploy.sh",
+    "logs": "pm2 logs eloward-bot"
+  },
+  "dependencies": {
+    "irc-framework": "^4.13.0",
+    "node-fetch": "^2.6.7"
+  }
+}
