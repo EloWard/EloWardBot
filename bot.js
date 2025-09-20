@@ -236,10 +236,8 @@ class EloWardTwitchBot {
       console.log(`✅ Joined ${channels.length} channels:`, channels);
     } catch (error) {
       console.error('❌ Failed to load channels:', error.message);
-      // Fallback: join a test channel
-      console.log('🔄 Falling back to test channel...');
-      this.bot.join('#yomata1');
-      this.channels.add('yomata1');
+      console.log('⚠️ No channels loaded - bot will not join any channels automatically');
+      // Note: Channels must be configured via the dashboard or API
     }
   }
 }
