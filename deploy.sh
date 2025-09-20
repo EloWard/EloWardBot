@@ -4,7 +4,7 @@
 SERVER_USER="bitnami"
 SERVER_IP="35.94.69.109"  # Replace with your actual IP
 SSH_KEY="./eloward-twitch-bot-key.pem"  # Update this path
-APP_DIR="/home/bitnami/eloward-bot"
+APP_DIR="/home/bitnami/elowardbot"
 
 echo "🚀 Deploying EloWard Twitch Bot..."
 
