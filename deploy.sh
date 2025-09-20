@@ -16,7 +16,7 @@ scp -i $SSH_KEY bot.js package.json $SERVER_USER@$SERVER_IP:$APP_DIR/
 
 # Install dependencies and restart bot
 ssh -i $SSH_KEY $SERVER_USER@$SERVER_IP << 'EOF'
-cd /home/bitnami/eloward-bot
+cd /home/bitnami/elowardbot
 npm install
 
 # Kill existing bot process if running
@@ -24,8 +24,8 @@ pkill -f "node bot.js" || true
 
 # Start bot with PM2
 npm install -g pm2 2>/dev/null || sudo npm install -g pm2
-pm2 delete eloward-bot || true
-pm2 start bot.js --name eloward-bot
+pm2 delete elowardbot || true
+pm2 start bot.js --name elowardbot
 pm2 save
 pm2 startup
 
