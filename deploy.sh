@@ -12,7 +12,13 @@ echo "🚀 Deploying EloWard Twitch Bot..."
 ssh -i $SSH_KEY $SERVER_USER@$SERVER_IP "mkdir -p $APP_DIR"
 
 # Copy files to server
-scp -i $SSH_KEY bot.js package.json .env $SERVER_USER@$SERVER_IP:$APP_DIR/
+scp -i $SSH_KEY bot.js package.json $SERVER_USER@$SERVER_IP:$APP_DIR/
+
+# Create .env file on server (no static TWITCH_TOKEN needed anymore)
+ssh -i $SSH_KEY $SERVER_USER@$SERVER_IP "cat > $APP_DIR/.env << 'EOF'
+# Dynamic token management - tokens are automatically synced from Cloudflare Worker
+CF_WORKER_URL=https://eloward-bot.unleashai.workers.dev
+EOF"
 
 # Install dependencies and restart bot
 ssh -i $SSH_KEY $SERVER_USER@$SERVER_IP << 'EOF'
