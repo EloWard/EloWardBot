@@ -2,9 +2,10 @@
 
 # Configuration
 SERVER_USER="ubuntu"  # Changed from bitnami to ubuntu for better AWS integration
-SERVER_IP="YOUR_EC2_INSTANCE_IP"  # Replace with your actual EC2 instance IP from Phase 2
+SERVER_IP="${ELOWARD_SERVER_IP:-YOUR_EC2_INSTANCE_IP}"
 SSH_KEY="./eloward-bot-key.pem"
 APP_DIR="/home/ubuntu/elowardbot"
+REDIS_HOST="${ELOWARD_REDIS_HOST:-your-redis-endpoint.cache.amazonaws.com}"
 
 echo "🚀 Deploying Enhanced EloWard Twitch Bot with AWS Messaging..."
 
@@ -19,22 +20,15 @@ ssh -i $SSH_KEY $SERVER_USER@$SERVER_IP "cat > $APP_DIR/.env << 'EOF'
 # Cloudflare Worker Integration
 CF_WORKER_URL=https://eloward-bot.unleashai.workers.dev
 
-# AWS Configuration
-AWS_REGION=us-west-2
-AWS_ACCESS_KEY_ID=YOUR_ACCESS_KEY_ID
-AWS_SECRET_ACCESS_KEY=YOUR_SECRET_ACCESS_KEY
+# AWS Configuration (EC2 uses IAM role - no keys needed)
+AWS_REGION=us-east-2
 
-# SQS Configuration (replace with your queue URL)
-SQS_QUEUE_URL=https://sqs.us-west-2.amazonaws.com/ACCOUNT_ID/eloward-bot-queue
+# SQS Configuration
+SQS_QUEUE_URL=$ELOWARD_SQS_URL
 
-# ElastiCache Redis Configuration (replace with your cluster endpoint)
-REDIS_HOST=eloward-bot.xxxxx.cache.amazonaws.com
+# ElastiCache Redis Configuration  
+REDIS_HOST=$ELOWARD_REDIS_HOST
 REDIS_PORT=6379
-REDIS_PASSWORD=your-redis-password-if-auth-enabled
-REDIS_URL=https://your-redis-rest-api.com  # For CF Worker Redis API calls
-
-# Optional Redis token for REST API
-REDIS_TOKEN=your-redis-rest-token
 EOF"
 
 # Install dependencies and restart bot
