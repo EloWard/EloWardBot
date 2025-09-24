@@ -15,13 +15,20 @@ ssh -i $SSH_KEY $SERVER_USER@$SERVER_IP "mkdir -p $APP_DIR"
 # Copy files to server
 scp -i $SSH_KEY bot.js package.json $SERVER_USER@$SERVER_IP:$APP_DIR/
 
-# Create enhanced .env file on server
-ssh -i $SSH_KEY $SERVER_USER@$SERVER_IP "cat > $APP_DIR/.env << 'EOF'
+# Create enhanced .env file on server with environment variable substitution
+ssh -i $SSH_KEY $SERVER_USER@$SERVER_IP "
+export ELOWARD_SQS_URL='$ELOWARD_SQS_URL'
+export ELOWARD_REDIS_HOST='$ELOWARD_REDIS_HOST' 
+export AWS_ACCESS_KEY_ID='$AWS_ACCESS_KEY_ID'
+export AWS_SECRET_ACCESS_KEY='$AWS_SECRET_ACCESS_KEY'
+cat > $APP_DIR/.env << EOF
 # Cloudflare Worker Integration
 CF_WORKER_URL=https://eloward-bot.unleashai.workers.dev
 
-# AWS Configuration (EC2 uses IAM role - no keys needed)
+# AWS Configuration
 AWS_REGION=us-east-2
+AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
 
 # SQS Configuration
 SQS_QUEUE_URL=$ELOWARD_SQS_URL
@@ -29,7 +36,8 @@ SQS_QUEUE_URL=$ELOWARD_SQS_URL
 # ElastiCache Redis Configuration  
 REDIS_HOST=$ELOWARD_REDIS_HOST
 REDIS_PORT=6379
-EOF"
+EOF
+"
 
 # Install dependencies and restart bot
 ssh -i $SSH_KEY $SERVER_USER@$SERVER_IP << 'EOF'
