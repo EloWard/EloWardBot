@@ -142,7 +142,7 @@ Resources:
     Properties:
       QueueName: eloward-bot-queue
       MessageRetentionPeriod: 1209600  # 14 days
-      VisibilityTimeoutSeconds: 300    # 5 minutes
+      VisibilityTimeout: 300    # 5 minutes
       ReceiveMessageWaitTimeSeconds: 20 # Long polling
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
@@ -223,7 +223,7 @@ Resources:
     Properties:
       LaunchTemplateName: EloWard-Bot-Template
       LaunchTemplateData:
-        ImageId: ami-0c7217cdde317cfec  # Amazon Linux 2 AMI (us-east-2)
+        ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
         InstanceType: !Ref InstanceType
         KeyName: !Ref KeyName
         SecurityGroupIds:
@@ -239,13 +239,24 @@ Resources:
             # Install CloudWatch agent
             yum install -y amazon-cloudwatch-agent
 
-            # Create bot user
-            useradd -m -s /bin/bash botuser
-            mkdir -p /home/botuser/elowardbot
-            chown -R botuser:botuser /home/botuser/elowardbot
+            # Create bot user (ubuntu for consistency with deploy script)
+            useradd -m -s /bin/bash ubuntu
+            mkdir -p /home/ubuntu/elowardbot
+            chown -R ubuntu:ubuntu /home/ubuntu/elowardbot
 
             # Install PM2 globally
             npm install -g pm2
+
+            # Enable SSH access for ubuntu user
+            if [ -d /home/ec2-user/.ssh ]; then
+              cp -r /home/ec2-user/.ssh /home/ubuntu/
+              chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+              chmod 700 /home/ubuntu/.ssh
+              chmod 600 /home/ubuntu/.ssh/*
+            fi
+
+            # Add ubuntu to sudoers
+            echo "ubuntu ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
             echo "Bot instance ready for deployment"
 
