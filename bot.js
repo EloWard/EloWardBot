@@ -1,6 +1,8 @@
 require('dotenv').config();
 const irc = require('irc-framework');
 const fetch = require('node-fetch');
+const { SQSClient, ReceiveMessageCommand, DeleteMessageCommand } = require("@aws-sdk/client-sqs");
+const Redis = require('ioredis');
 
 class EloWardTwitchBot {
   constructor() {
@@ -10,15 +12,40 @@ class EloWardTwitchBot {
     this.currentToken = null;
     this.tokenExpiresAt = 0;
     this.reconnectAttempts = 0;
-    this.maxReconnectDelay = 30000; // 30 seconds max
+    this.maxReconnectDelay = 30000;
     this.tokenCheckInterval = null;
+    
+    // AWS SQS Configuration
+    this.sqs = new SQSClient({ 
+      region: process.env.AWS_REGION || 'us-west-2',
+      credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+      }
+    });
+    this.queueUrl = process.env.SQS_QUEUE_URL;
+    
+    // Redis Configuration
+    this.redis = null;
+    if (process.env.REDIS_URL) {
+      this.redis = new Redis({
+        host: process.env.REDIS_HOST,
+        port: parseInt(process.env.REDIS_PORT) || 6379,
+        password: process.env.REDIS_PASSWORD,
+        retryDelayOnFailure: 100,
+        enableOfflineQueue: false,
+        lazyConnect: true
+      });
+    }
   }
 
   async start() {
-    console.log('🚀 Starting EloWard Twitch Bot with dynamic token management...');
+    console.log('🚀 Starting EloWard Twitch Bot with AWS messaging...');
     console.log('📡 CF Worker URL:', this.CLOUDFLARE_WORKER_URL);
+    console.log('📨 SQS Queue:', this.queueUrl ? 'Configured' : 'Not configured');
+    console.log('⚡ Redis:', this.redis ? 'Configured' : 'Not configured');
 
-    // Get fresh token from CF Worker instead of static env var
+    // Get fresh token from CF Worker
     const tokenData = await this.getTokenFromWorker();
     if (!tokenData) {
       console.error('❌ Failed to get token from CF Worker');
@@ -36,6 +63,10 @@ class EloWardTwitchBot {
     await this.connectToTwitch();
     this.setupEventHandlers();
     this.startTokenMonitoring();
+    
+    // Start messaging systems
+    this.startSQSPolling();
+    this.startRedisSubscription();
   }
 
   // PRODUCTION TOKEN SYNC - Get current token from CF Worker
@@ -85,25 +116,25 @@ class EloWardTwitchBot {
     });
   }
 
-  // PRODUCTION TOKEN MONITORING - Refresh before expiry
+  // PRODUCTION TOKEN MONITORING - Refresh before expiry + Channel reloading
   startTokenMonitoring() {
-    // Check token every 15 minutes (more responsive)
+    // Check token every 15 minutes
     this.tokenCheckInterval = setInterval(async () => {
       const now = Date.now();
       const expiresInMinutes = Math.floor((this.tokenExpiresAt - now) / 60000);
       
       console.log('🔍 Token health check', { 
         expiresInMinutes,
-        needsRefresh: expiresInMinutes < 120, // Refresh if expires in 2 hours (more proactive)
+        needsRefresh: expiresInMinutes < 120,
         timestamp: new Date().toISOString()
       });
 
-      // Refresh if expires in next 2 hours (more proactive)
+      // Refresh if expires in next 2 hours
       if (expiresInMinutes < 120) {
         console.log('🔄 Token needs refresh - syncing with CF Worker');
         await this.refreshToken();
       }
-    }, 15 * 60 * 1000); // Every 15 minutes (more frequent checks)
+    }, 15 * 60 * 1000);
   }
 
   async refreshToken() {
@@ -125,7 +156,6 @@ class EloWardTwitchBot {
         console.log('🔄 Token changed - reconnecting to Twitch...');
         this.bot.quit('Token refresh - reconnecting');
         
-        // Reconnect with new token after short delay
         setTimeout(() => {
           this.connectToTwitch();
         }, 2000);
@@ -143,8 +173,14 @@ class EloWardTwitchBot {
   setupEventHandlers() {
     this.bot.on('registered', () => {
       console.log('✅ Connected to Twitch IRC successfully!');
-      this.reconnectAttempts = 0; // Reset on successful connection
+      this.reconnectAttempts = 0;
       this.loadChannelsFromCloudflare();
+      
+      // Post-startup channel check
+      setTimeout(() => {
+        console.log('🔄 Post-startup channel check...');
+        this.reloadChannelsIfNeeded();
+      }, 5000);
     });
 
     this.bot.on('privmsg', this.handleMessage.bind(this));
@@ -164,7 +200,6 @@ class EloWardTwitchBot {
   async handleConnectionError(error) {
     console.error('🔌 Connection error occurred:', error.message);
     
-    // Don't reconnect if we're in the middle of a token refresh
     if (error.message === 'Token refresh - reconnecting') {
       return;
     }
@@ -176,7 +211,6 @@ class EloWardTwitchBot {
     
     setTimeout(async () => {
       try {
-        // Get fresh token before reconnecting (in case token was the issue)
         const tokenData = await this.getTokenFromWorker();
         if (tokenData) {
           this.currentToken = tokenData.token;
@@ -186,7 +220,6 @@ class EloWardTwitchBot {
         await this.connectToTwitch();
       } catch (e) {
         console.error(`❌ Reconnection attempt ${this.reconnectAttempts} failed:`, e.message);
-        // Will trigger another reconnection attempt
       }
     }, delay);
   }
@@ -199,7 +232,6 @@ class EloWardTwitchBot {
     console.log(`📝 [${channel}] ${user}: ${message}`);
 
     try {
-      // Call your existing Cloudflare Worker
       const response = await fetch(`${this.CLOUDFLARE_WORKER_URL}/check-message`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -237,10 +269,174 @@ class EloWardTwitchBot {
     } catch (error) {
       console.error('❌ Failed to load channels:', error.message);
       console.log('⚠️ No channels loaded - bot will not join any channels automatically');
-      // Note: Channels must be configured via the dashboard or API
     }
   }
+
+  // Dynamic channel reloading (join new, leave removed)
+  async reloadChannelsIfNeeded() {
+    try {
+      console.log('🔍 Checking for channel changes...');
+      const response = await fetch(`${this.CLOUDFLARE_WORKER_URL}/channels`);
+      
+      if (!response.ok) {
+        console.log(`⚠️ Channel reload failed: HTTP ${response.status}`);
+        return;
+      }
+      
+      const { channels: newChannels } = await response.json();
+      const newChannelSet = new Set(newChannels);
+      const currentChannels = Array.from(this.channels);
+      
+      const channelsToJoin = newChannels.filter(channel => !this.channels.has(channel));
+      const channelsToLeave = currentChannels.filter(channel => !newChannelSet.has(channel));
+      
+      // Join new channels
+      if (channelsToJoin.length > 0) {
+        console.log(`📥 Joining ${channelsToJoin.length} new channels:`, channelsToJoin);
+        for (const channel of channelsToJoin) {
+          this.bot.join(`#${channel}`);
+          this.channels.add(channel);
+          console.log(`✅ Joined: #${channel}`);
+          await new Promise(resolve => setTimeout(resolve, 200));
+        }
+      }
+      
+      // Leave removed channels
+      if (channelsToLeave.length > 0) {
+        console.log(`📤 Leaving ${channelsToLeave.length} removed channels:`, channelsToLeave);
+        for (const channel of channelsToLeave) {
+          this.bot.part(`#${channel}`);
+          this.channels.delete(channel);
+          console.log(`👋 Left: #${channel}`);
+          await new Promise(resolve => setTimeout(resolve, 200));
+        }
+      }
+      
+      if (channelsToJoin.length === 0 && channelsToLeave.length === 0) {
+        console.log('✅ No channel changes detected');
+      } else {
+        console.log(`🔄 Channel reload complete. Now in ${this.channels.size} channels:`, Array.from(this.channels));
+      }
+      
+    } catch (error) {
+      console.error('❌ Channel reload failed:', error.message);
+    }
+  }
+
+  // SQS message polling for reliable delivery
+  startSQSPolling() {
+    if (!this.queueUrl) {
+      console.log('⚠️ SQS not configured - skipping SQS polling');
+      return;
+    }
+
+    console.log('🔄 Starting SQS message polling...');
+    
+    const pollSQS = async () => {
+      try {
+        const command = new ReceiveMessageCommand({
+          QueueUrl: this.queueUrl,
+          MaxNumberOfMessages: 10,
+          WaitTimeSeconds: 20, // Long polling
+          MessageAttributeNames: ['All']
+        });
+        
+        const response = await this.sqs.send(command);
+        
+        if (response.Messages) {
+          for (const message of response.Messages) {
+            await this.handleSQSMessage(message);
+            
+            // Delete processed message
+            await this.sqs.send(new DeleteMessageCommand({
+              QueueUrl: this.queueUrl,
+              ReceiptHandle: message.ReceiptHandle
+            }));
+          }
+        }
+      } catch (error) {
+        console.error('❌ SQS polling error:', error.message);
+      }
+      
+      // Continue polling
+      setTimeout(pollSQS, 1000);
+    };
+
+    // Start polling
+    pollSQS();
+  }
+
+  async handleSQSMessage(message) {
+    try {
+      const body = JSON.parse(message.Body);
+      console.log('📨 SQS message received:', body);
+      
+      if (body.action === 'enable' || body.action === 'disable') {
+        console.log('🔔 Channel change notification via SQS:', body.action, body.channel);
+        await this.reloadChannelsIfNeeded();
+      }
+    } catch (error) {
+      console.error('❌ SQS message handling error:', error.message);
+    }
+  }
+
+  // Redis subscription for instant notifications
+  startRedisSubscription() {
+    if (!this.redis) {
+      console.log('⚠️ Redis not configured - skipping Redis subscription');
+      return;
+    }
+
+    console.log('🔄 Starting Redis subscription...');
+    
+    this.redis.connect().then(() => {
+      console.log('✅ Connected to Redis');
+      
+      this.redis.subscribe('eloward:bot:commands');
+      
+      this.redis.on('message', async (channel, message) => {
+        if (channel === 'eloward:bot:commands') {
+          try {
+            const data = JSON.parse(message);
+            console.log('⚡ Redis message received:', data);
+            
+            if (data.action === 'enable' || data.action === 'disable') {
+              console.log('🔔 Instant channel change notification via Redis:', data.action, data.channel);
+              await this.reloadChannelsIfNeeded();
+            }
+          } catch (error) {
+            console.error('❌ Redis message handling error:', error.message);
+          }
+        }
+      });
+      
+      this.redis.on('error', (error) => {
+        console.error('❌ Redis connection error:', error.message);
+      });
+      
+      this.redis.on('reconnecting', () => {
+        console.log('🔄 Redis reconnecting...');
+      });
+      
+    }).catch((error) => {
+      console.error('❌ Redis connection failed:', error.message);
+      console.log('⚠️ Continuing without Redis - SQS will handle messaging');
+    });
+  }
 }
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('👋 Shutting down gracefully...');
+  if (bot.redis) bot.redis.disconnect();
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log('👋 Interrupted - shutting down gracefully...');
+  if (bot.redis) bot.redis.disconnect();
+  process.exit(0);
+});
 
 // Start the bot
 const bot = new EloWardTwitchBot();

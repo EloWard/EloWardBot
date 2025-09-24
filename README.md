@@ -1,6 +1,6 @@
 # EloWard Twitch Bot
 
-A Twitch IRC bot that enforces League of Legends rank requirements in chat using AWS Lightsail for IRC connections and Cloudflare Workers for business logic.
+A Twitch IRC bot that enforces League of Legends rank requirements in chat using AWS EC2 Auto Scaling for IRC connections and Cloudflare Workers for business logic.
 
 ## 🎯 **What It Does**
 
@@ -14,7 +14,7 @@ The EloWardBot monitors Twitch chat and automatically times out users who don't 
 
 ## 🏗️ **Architecture Overview**
 
-### **Hybrid Architecture**
+### **Production Hybrid Architecture (Enhanced)**
 ```
 ┌─────────────── CLOUDFLARE WORKERS (Business Logic) ────────────────┐
 │                                                                    │
@@ -23,46 +23,55 @@ The EloWardBot monitors Twitch chat and automatically times out users who don't 
 │  • OAuth Refresh            • Database Queries       • Channels     │
 │  • Business Logic           • Service Bindings       • Config       │
 │  • Timeout API Calls        • Edge Network           • Storage      │
+│  • SQS Message Sending      • Redis Pub/Sub          • Monitoring   │
 │                                                                    │
 │  💾 KV Storage              🗄️ D1 Database                          │
 │  • Bot Tokens               • Channel Configuration                │
 │  • Global Replication       • User Ranks & Data                   │
 │                                                                    │
-└──────────────────┬─────────────────────────────────────────────────┘
-                   │ 
-                   │ Token Sync API (/token endpoint)
-                   │ Message Processing API (/check-message)
-                   │ Channel List API (/channels)
-                   │
-    ┌──────────────▼─────────────────┐
-    │         AWS LIGHTSAIL          │
-    │                                │
-    │  🤖 IRC Bot (Node.js)          │
-    │  • Persistent IRC Connection   │
-    │  • Message Ingestion          │
-    │  • Dynamic Token Management   │
-    │  • Error Recovery & Reconnect │
-    │                                │
-    └────────────────────────────────┘
+└──────┬────────────────────┬────────────────────────────────────────┘
+       │                    │
+       │ SQS Messages      │ Redis Pub/Sub
+       │ (Reliable)        │ (Instant)
+       │                    │
+┌──────▼────────────────────▼─────────────────────────────────────────┐
+│                        AWS CLOUD                                   │
+│                                                                    │
+│  📨 Amazon SQS          ⚡ ElastiCache Redis        🖥️ EC2/ASG      │
+│  • Guaranteed Delivery   • Sub-ms Notifications    • Auto Scaling  │
+│  • Dead Letter Queue     • High Throughput         • Health Checks │
+│  • Message Ordering      • Pub/Sub Patterns        • Load Balance  │
+│  • Retry Logic          • In-Memory Speed          • Monitoring    │
+│                                                                    │
+│               🤖 Enhanced IRC Bot (Node.js)                        │
+│               • Persistent IRC Connection                          │
+│               • SQS Long Polling                                  │
+│               • Redis Subscription                                │
+│               • Dual Message Processing                           │
+│               • Enhanced Error Recovery                           │
+│                                                                    │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
 ### **Architecture Design**
 
-The system uses a hybrid approach where Cloudflare Workers handle stateless business logic and token management, while AWS Lightsail maintains the persistent IRC connection. This separation allows for optimal platform utilization.
+The system uses a hybrid approach where Cloudflare Workers handle stateless business logic and token management, while AWS EC2 Auto Scaling Groups maintain persistent IRC connections with SQS+Redis messaging for reliable, high-performance communication.
 
 ## 🔧 **Components**
 
-### **1. IRC Bot (AWS Lightsail)**
+### **1. IRC Bot (AWS EC2 Auto Scaling)**
 **File**: `bot.js`
 
-- **Purpose**: Maintains persistent connection to Twitch IRC
+- **Purpose**: Maintains persistent connection to Twitch IRC with production-grade messaging
 - **Responsibilities**:
   - Connect to `irc.chat.twitch.tv` with OAuth token
-  - Join/leave channels dynamically
+  - Join/leave channels dynamically via SQS+Redis messaging
   - Process incoming chat messages
   - Forward messages to CF Worker for rank checking
   - Handle connection errors with exponential backoff
   - Monitor token expiration and refresh automatically
+  - Poll SQS for reliable message delivery
+  - Subscribe to Redis for instant notifications
 
 **Key Features**:
 ```javascript

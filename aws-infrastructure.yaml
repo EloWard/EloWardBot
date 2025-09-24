@@ -1,0 +1,295 @@
+# AWS CloudFormation Template for EloWard Bot Infrastructure
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Production-grade infrastructure for EloWard Twitch Bot with SQS + Redis'
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    Description: EC2 instance type for the bot
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to enable SSH access
+  VpcCIDR:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC
+
+Resources:
+  # VPC and Networking
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: EloWard-Bot-VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: EloWard-Bot-IGW
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: EloWard-Bot-Public-Subnet
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      CidrBlock: 10.0.2.0/24
+      Tags:
+        - Key: Name
+          Value: EloWard-Bot-Private-Subnet
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: EloWard-Bot-Routes
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref PublicSubnet
+
+  # Security Groups
+  BotSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: EloWard-Bot-SG
+      GroupDescription: Security group for EloWard Bot EC2 instance
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH access
+        # No need for port 3000 - we use SQS/Redis instead!
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: EloWard-Bot-SG
+
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: EloWard-Redis-SG
+      GroupDescription: Security group for ElastiCache Redis cluster
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref BotSecurityGroup
+          Description: Redis access from bot instances
+      Tags:
+        - Key: Name
+          Value: EloWard-Redis-SG
+
+  # SQS Queue
+  BotMessageQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: eloward-bot-queue
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeoutSeconds: 300    # 5 minutes
+      ReceiveMessageWaitTimeSeconds: 20 # Long polling
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: eloward-bot-dlq
+      MessageRetentionPeriod: 1209600
+
+  # ElastiCache Subnet Group
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Subnet group for EloWard Redis cluster
+      SubnetIds:
+        - !Ref PrivateSubnet
+        - !Ref PublicSubnet
+
+  # ElastiCache Redis Cluster
+  RedisCluster:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      CacheNodeType: cache.t3.micro
+      Engine: redis
+      NumCacheNodes: 1
+      Port: 6379
+      VpcSecurityGroupIds:
+        - !Ref RedisSecurityGroup
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      Tags:
+        - Key: Name
+          Value: EloWard-Bot-Redis
+
+  # IAM Role for EC2 Instance
+  BotInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: BotSQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt BotMessageQueue.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  BotInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref BotInstanceRole
+
+  # Launch Template for Bot Instance
+  BotLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: EloWard-Bot-Template
+      LaunchTemplateData:
+        ImageId: ami-0c02fb55956c7d316  # Amazon Linux 2 AMI (update for your region)
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - !Ref BotSecurityGroup
+        IamInstanceProfile:
+          Arn: !GetAtt BotInstanceProfile.Arn
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y nodejs npm git
+
+            # Install CloudWatch agent
+            yum install -y amazon-cloudwatch-agent
+
+            # Create bot user
+            useradd -m -s /bin/bash botuser
+            mkdir -p /home/botuser/elowardbot
+            chown -R botuser:botuser /home/botuser/elowardbot
+
+            # Install PM2 globally
+            npm install -g pm2
+
+            echo "Bot instance ready for deployment"
+
+  # Auto Scaling Group (for high availability)
+  BotAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: EloWard-Bot-ASG
+      LaunchTemplate:
+        LaunchTemplateId: !Ref BotLaunchTemplate
+        Version: !GetAtt BotLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 3
+      DesiredCapacity: 1
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: EloWard-Bot-Instance
+          PropagateAtLaunch: true
+
+  # CloudWatch Alarms
+  QueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Monitor SQS queue depth
+      AlarmActions: []  # Add SNS topic ARN for notifications
+      MetricName: ApproximateNumberOfVisibleMessages
+      Namespace: AWS/SQS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt BotMessageQueue.QueueName
+
+Outputs:
+  QueueURL:
+    Description: SQS Queue URL for bot messaging
+    Value: !Ref BotMessageQueue
+    Export:
+      Name: EloWard-Bot-Queue-URL
+
+  RedisEndpoint:
+    Description: ElastiCache Redis cluster endpoint
+    Value: !GetAtt RedisCluster.RedisEndpoint.Address
+    Export:
+      Name: EloWard-Bot-Redis-Endpoint
+
+  BotInstanceRole:
+    Description: IAM Role ARN for bot instances
+    Value: !GetAtt BotInstanceRole.Arn
+    Export:
+      Name: EloWard-Bot-Instance-Role
+
+  VPCId:
+    Description: VPC ID for the EloWard infrastructure
+    Value: !Ref VPC
+    Export:
+      Name: EloWard-Bot-VPC
