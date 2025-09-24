@@ -1,7 +1,7 @@
 {
   "name": "elowardbot",
   "version": "1.0.0",
-  "description": "EloWard Twitch Bot",
+  "description": "EloWard Twitch Bot - Production SQS+Redis Architecture",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
@@ -11,6 +11,8 @@
   "dependencies": {
     "irc-framework": "^4.13.0",
     "node-fetch": "^2.6.7",
-    "dotenv": "^16.0.0"
+    "dotenv": "^16.0.0",
+    "@aws-sdk/client-sqs": "^3.456.0",
+    "ioredis": "^5.3.2"
   }
 }
