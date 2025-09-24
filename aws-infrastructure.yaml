@@ -57,6 +57,7 @@ Resources:
       VpcId: !Ref VPC
       AvailabilityZone: !Select [ 1, !GetAZs '' ]
       CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: false
       Tags:
         - Key: Name
           Value: EloWard-Bot-Private-Subnet
@@ -82,6 +83,20 @@ Resources:
     Properties:
       RouteTableId: !Ref RouteTable
       SubnetId: !Ref PublicSubnet
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: EloWard-Bot-Private-Routes
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet
 
   # Security Groups
   BotSecurityGroup:
@@ -208,7 +223,7 @@ Resources:
     Properties:
       LaunchTemplateName: EloWard-Bot-Template
       LaunchTemplateData:
-        ImageId: ami-0c02fb55956c7d316  # Amazon Linux 2 AMI (update for your region)
+        ImageId: ami-0c7217cdde317cfec  # Amazon Linux 2 AMI (us-east-2)
         InstanceType: !Ref InstanceType
         KeyName: !Ref KeyName
         SecurityGroupIds:
