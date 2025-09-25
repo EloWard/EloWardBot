@@ -14,7 +14,7 @@ The EloWardBot monitors Twitch chat and automatically times out users who don't 
 
 ## 🏗️ **Architecture Overview**
 
-### **Production Hybrid Architecture (Enhanced)**
+### **Production Redis-First Architecture**
 ```
 ┌─────────────── CLOUDFLARE WORKERS (Business Logic) ────────────────┐
 │                                                                    │
@@ -23,55 +23,53 @@ The EloWardBot monitors Twitch chat and automatically times out users who don't 
 │  • OAuth Refresh            • Database Queries       • Channels     │
 │  • Business Logic           • Service Bindings       • Config       │
 │  • Timeout API Calls        • Edge Network           • Storage      │
-│  • SQS Message Sending      • Redis Pub/Sub          • Monitoring   │
+│  • Redis Pub/Sub Instant    • Global Distribution    • Monitoring   │
 │                                                                    │
 │  💾 KV Storage              🗄️ D1 Database                          │
 │  • Bot Tokens               • Channel Configuration                │
 │  • Global Replication       • User Ranks & Data                   │
 │                                                                    │
-└──────┬────────────────────┬────────────────────────────────────────┘
-       │                    │
-       │ SQS Messages      │ Redis Pub/Sub
-       │ (Reliable)        │ (Instant)
-       │                    │
-┌──────▼────────────────────▼─────────────────────────────────────────┐
-│                        AWS CLOUD                                   │
-│                                                                    │
-│  📨 Amazon SQS          ⚡ ElastiCache Redis        🖥️ EC2/ASG      │
-│  • Guaranteed Delivery   • Sub-ms Notifications    • Auto Scaling  │
-│  • Dead Letter Queue     • High Throughput         • Health Checks │
-│  • Message Ordering      • Pub/Sub Patterns        • Load Balance  │
-│  • Retry Logic          • In-Memory Speed          • Monitoring    │
-│                                                                    │
-│               🤖 Enhanced IRC Bot (Node.js)                        │
-│               • Persistent IRC Connection                          │
-│               • SQS Long Polling                                  │
-│               • Redis Subscription                                │
-│               • Dual Message Processing                           │
-│               • Enhanced Error Recovery                           │
-│                                                                    │
-└────────────────────────────────────────────────────────────────────┘
+└──────┬──────────────────────────────────────────────────────────────┘
+       │ Redis Pub/Sub (Primary - Instant)
+       │ 
+┌──────▼─────────────────────────────────────────────────────────────┐
+│                        AWS CLOUD                                  │
+│                                                                   │
+│  ⚡ ElastiCache Redis        📨 Amazon SQS        🖥️ EC2/ASG     │
+│  • Sub-ms Notifications      • Backup Reliability • Auto Scaling │
+│  • High Throughput          • Dead Letter Queue   • Health Checks│
+│  • Pub/Sub Patterns         • Message Ordering    • Load Balance │
+│  • In-Memory Speed          • Retry Logic         • Monitoring   │
+│                                                                   │
+│               🤖 IRC Bot (Node.js)                                │
+│               • Persistent IRC Connection                         │
+│               • Redis Subscription (Primary)                     │
+│               • SQS Long Polling (Backup)                        │
+│               • Instant Channel Updates                          │
+│               • Enhanced Error Recovery                          │
+│                                                                   │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
 ### **Architecture Design**
 
-The system uses a hybrid approach where Cloudflare Workers handle stateless business logic and token management, while AWS EC2 Auto Scaling Groups maintain persistent IRC connections with SQS+Redis messaging for reliable, high-performance communication.
+The system uses a Redis-first approach where Cloudflare Workers handle stateless business logic and token management, while AWS EC2 Auto Scaling Groups maintain persistent IRC connections. Redis provides instant pub/sub notifications for real-time channel updates, with SQS as a backup for guaranteed message delivery.
 
 ## 🔧 **Components**
 
 ### **1. IRC Bot (AWS EC2 Auto Scaling)**
 **File**: `bot.js`
 
-- **Purpose**: Maintains persistent connection to Twitch IRC with production-grade messaging
+- **Purpose**: Maintains persistent connection to Twitch IRC with Redis-first messaging
 - **Responsibilities**:
   - Connect to `irc.chat.twitch.tv` with OAuth token
-  - Join/leave channels dynamically via SQS+Redis messaging
+  - Join/leave channels instantly via Redis pub/sub
   - Process incoming chat messages
   - Forward messages to CF Worker for rank checking
   - Handle connection errors with exponential backoff
   - Monitor token expiration and refresh automatically
-  - Poll SQS for reliable message delivery
-  - Subscribe to Redis for instant notifications
+  - Subscribe to Redis for instant notifications (primary)
+  - Poll SQS for reliable backup delivery
 
 **Key Features**:
 ```javascript

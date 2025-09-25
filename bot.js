@@ -40,10 +40,11 @@ class EloWardTwitchBot {
   }
 
   async start() {
-    console.log('🚀 Starting EloWard Twitch Bot with AWS messaging...');
+    console.log('🚀 Starting EloWard Twitch Bot with instant Redis notifications...');
     console.log('📡 CF Worker URL:', this.CLOUDFLARE_WORKER_URL);
-    console.log('📨 SQS Queue:', this.queueUrl ? 'Configured' : 'Not configured');
-    console.log('⚡ Redis:', this.redis ? 'Configured' : 'Not configured');
+    console.log('⚡ Redis:', this.redis ? 'Configured for instant notifications' : 'Not configured - using polling only');
+    console.log('📨 SQS Queue:', this.queueUrl ? 'Available for testing/backup' : 'Not configured');
+    console.log('🔄 Periodic Polling: 15-minute fallback for reliability');
 
     // Get fresh token from CF Worker
     const tokenData = await this.getTokenFromWorker();
@@ -64,9 +65,9 @@ class EloWardTwitchBot {
     this.setupEventHandlers();
     this.startTokenMonitoring();
     
-    // Start messaging systems
-    this.startSQSPolling();
+    // Start messaging systems - Redis first for instant notifications
     this.startRedisSubscription();
+    this.startSQSPolling();
   }
 
   // PRODUCTION TOKEN SYNC - Get current token from CF Worker
@@ -323,14 +324,14 @@ class EloWardTwitchBot {
     }
   }
 
-  // SQS message polling for reliable delivery
+  // SQS message polling for reliable backup delivery
   startSQSPolling() {
     if (!this.queueUrl) {
-      console.log('⚠️ SQS not configured - skipping SQS polling');
+      console.log('⚠️ SQS not configured - no backup messaging');
       return;
     }
 
-    console.log('🔄 Starting SQS message polling...');
+    console.log('🔄 Starting SQS backup polling...');
     
     const pollSQS = async () => {
       try {
@@ -369,10 +370,10 @@ class EloWardTwitchBot {
   async handleSQSMessage(message) {
     try {
       const body = JSON.parse(message.Body);
-      console.log('📨 SQS message received:', body);
+      console.log('📨 SQS backup message received:', body);
       
       if (body.action === 'enable' || body.action === 'disable') {
-        console.log('🔔 Channel change notification via SQS:', body.action, body.channel);
+        console.log('🔔 Channel update via SQS backup:', body.action, body.channel);
         await this.reloadChannelsIfNeeded();
       }
     } catch (error) {
@@ -380,17 +381,17 @@ class EloWardTwitchBot {
     }
   }
 
-  // Redis subscription for instant notifications
+  // Redis subscription for instant notifications (primary method)
   startRedisSubscription() {
     if (!this.redis) {
-      console.log('⚠️ Redis not configured - skipping Redis subscription');
+      console.log('⚠️ Redis not configured - relying on SQS for channel updates');
       return;
     }
 
-    console.log('🔄 Starting Redis subscription...');
+    console.log('🔄 Starting Redis subscription for instant notifications...');
     
     this.redis.connect().then(() => {
-      console.log('✅ Connected to Redis');
+      console.log('✅ Connected to Redis for instant channel updates');
       
       this.redis.subscribe('eloward:bot:commands');
       
@@ -398,10 +399,10 @@ class EloWardTwitchBot {
         if (channel === 'eloward:bot:commands') {
           try {
             const data = JSON.parse(message);
-            console.log('⚡ Redis message received:', data);
+            console.log('⚡ Instant Redis notification:', data);
             
             if (data.action === 'enable' || data.action === 'disable') {
-              console.log('🔔 Instant channel change notification via Redis:', data.action, data.channel);
+              console.log('🚀 Instant channel update via Redis:', data.action, data.channel);
               await this.reloadChannelsIfNeeded();
             }
           } catch (error) {
@@ -420,7 +421,7 @@ class EloWardTwitchBot {
       
     }).catch((error) => {
       console.error('❌ Redis connection failed:', error.message);
-      console.log('⚠️ Continuing without Redis - SQS will handle messaging');
+      console.log('⚠️ Falling back to SQS-only messaging');
     });
   }
 }

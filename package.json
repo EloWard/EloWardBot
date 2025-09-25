@@ -1,7 +1,7 @@
 {
   "name": "elowardbot",
   "version": "1.0.0",
-  "description": "EloWard Twitch Bot - Production SQS+Redis Architecture",
+  "description": "EloWard Twitch Bot - Redis Instant + Polling Fallback Architecture",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
