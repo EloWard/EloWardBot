@@ -1,409 +1,501 @@
 # EloWard Twitch Bot
 
-A Twitch IRC bot that enforces League of Legends rank requirements in chat using AWS EC2 Auto Scaling for IRC connections and Cloudflare Workers for business logic.
+A production-grade Twitch IRC bot that enforces League of Legends rank requirements in chat using AWS ECS Fargate for secure hosting and Cloudflare Workers for business logic.
 
 ## 🎯 **What It Does**
 
-The EloWardBot monitors Twitch chat and automatically times out users who don't meet minimum rank requirements:
+EloWardBot creates a funnel to drive Twitch viewers to connect their League of Legends accounts to EloWard:
 
-- **Connects to Twitch IRC** and joins configured channels
-- **Processes every chat message** from non-privileged users
-- **Checks user's League of Legends rank** via the EloWard API
-- **Issues timeouts** (via Twitch Helix API) for users without sufficient rank
-- **Operates 24/7** with automatic error recovery and token management
+- **Always present in chat** (Standby mode) to respond instantly to `!eloward` commands
+- **Enforces rank requirements** when enabled, timing out users without connected LoL accounts
+- **Supports chat commands** (`!eloward on/off/mode minrank gold4`) for streamers and moderators
+- **Dashboard integration** with 1-3 second configuration updates
+- **Secure and scalable** with no exposed ports and HMAC-protected communications
 
 ## 🏗️ **Architecture Overview**
 
-### **Production Redis-First Architecture**
+### **Production Serverless + Containers Architecture**
 ```
-┌─────────────── CLOUDFLARE WORKERS (Business Logic) ────────────────┐
-│                                                                    │
-│  🔐 Bot Worker              📊 Rank Worker           👤 Users       │
-│  • Token Management         • LoL Rank Lookup        • User Data    │
-│  • OAuth Refresh            • Database Queries       • Channels     │
-│  • Business Logic           • Service Bindings       • Config       │
-│  • Timeout API Calls        • Edge Network           • Storage      │
-│  • Redis Pub/Sub Instant    • Global Distribution    • Monitoring   │
-│                                                                    │
-│  💾 KV Storage              🗄️ D1 Database                          │
-│  • Bot Tokens               • Channel Configuration                │
-│  • Global Replication       • User Ranks & Data                   │
-│                                                                    │
-└──────┬──────────────────────────────────────────────────────────────┘
-       │ Redis Pub/Sub (Primary - Instant)
-       │ 
-┌──────▼─────────────────────────────────────────────────────────────┐
-│                        AWS CLOUD                                  │
-│                                                                   │
-│  ⚡ ElastiCache Redis        📨 Amazon SQS        🖥️ EC2/ASG     │
-│  • Sub-ms Notifications      • Backup Reliability • Auto Scaling │
-│  • High Throughput          • Dead Letter Queue   • Health Checks│
-│  • Pub/Sub Patterns         • Message Ordering    • Load Balance │
-│  • In-Memory Speed          • Retry Logic         • Monitoring   │
-│                                                                   │
-│               🤖 IRC Bot (Node.js)                                │
-│               • Persistent IRC Connection                         │
-│               • Redis Subscription (Primary)                     │
-│               • SQS Long Polling (Backup)                        │
-│               • Instant Channel Updates                          │
-│               • Enhanced Error Recovery                          │
-│                                                                   │
-└───────────────────────────────────────────────────────────────────┘
+┌─────────────── CLOUDFLARE (Control Plane) ──────────────────┐
+│                                                             │
+│  🌐 Dashboard          🔐 Bot Worker         📊 Rank Worker │
+│  • React UI            • Token Management   • LoL Lookups  │
+│  • Pages Functions     • Config Updates     • D1 Queries   │  
+│  • Auth Flow           • HMAC Security      • Cache Logic  │
+│                        • Redis Publisher    • Fresh Data   │
+│                                                             │
+│  💾 KV Storage        🗄️ D1 Database        ⚡ Upstash     │
+│  • Bot Tokens         • bot_channels        • Redis Pub/Sub│
+│  • User Sessions      • lol_ranks           • Global CDN   │
+│                       • Audit Logs          • TLS + Auth   │
+│                                                             │
+└─────────────┬─────────────────────────────────────────────────┘
+              │ HMAC + Redis Pub/Sub (1-3s updates)
+              │
+┌─────────────▼─────────────────────────────────────────────────┐
+│                     AWS (Data Plane)                        │
+│                                                             │
+│  🐳 ECS Fargate                🌍 Multi-Region Ready        │
+│  • Containerized IRC Bot       • us-east-1 (primary)       │
+│  • No Inbound Ports           • eu-west-1 (future)        │
+│  • Auto-restart/Scale         • preferred_region in D1     │  
+│  • Outbound Only              • Redis Lease Coordination   │
+│                                                             │
+│              🤖 IRC Connection                              │
+│              • Persistent to irc.chat.twitch.tv            │
+│              • Always Joined (Standby ↔ Enforcing)         │
+│              • Token Refresh + Error Recovery               │
+│              • Chat Commands + Message Processing          │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### **Architecture Design**
+### **Presence Model (Key Innovation)**
 
-The system uses a Redis-first approach where Cloudflare Workers handle stateless business logic and token management, while AWS EC2 Auto Scaling Groups maintain persistent IRC connections. Redis provides instant pub/sub notifications for real-time channel updates, with SQS as a backup for guaranteed message delivery.
+**Always-Joined Design**: Bot joins channels immediately after OAuth Connect and stays joined:
 
-## 🔧 **Components**
+- **Standby Mode**: Passive presence, only responds to `!eloward` commands
+- **Enforcing Mode**: Active moderation, timeouts users without sufficient rank
+- **Instant Switching**: `!eloward on` takes effect in 1-3 seconds via Redis pub/sub
+- **Leave Only**: On permission revoke or disconnect - otherwise maintains presence
 
-### **1. IRC Bot (AWS EC2 Auto Scaling)**
+This solves the "chicken and egg" problem where users couldn't enable the bot because it wasn't in their channel.
+
+## 🔧 **Core Components**
+
+### **1. IRC Bot (AWS ECS Fargate)**
 **File**: `bot.js`
 
-- **Purpose**: Maintains persistent connection to Twitch IRC with Redis-first messaging
-- **Responsibilities**:
-  - Connect to `irc.chat.twitch.tv` with OAuth token
-  - Join/leave channels instantly via Redis pub/sub
-  - Process incoming chat messages
-  - Forward messages to CF Worker for rank checking
-  - Handle connection errors with exponential backoff
-  - Monitor token expiration and refresh automatically
-  - Subscribe to Redis for instant notifications (primary)
-  - Poll SQS for reliable backup delivery
+**Purpose**: Secure, always-on IRC presence with instant config updates
 
-**Key Features**:
+**Key Responsibilities**:
+- Maintain persistent connection to `irc.chat.twitch.tv`
+- Process all chat messages (fast prefix check in Standby)
+- Handle `!eloward` commands from broadcasters/mods
+- Make **local caching decisions** (config + rank lookups)
+- Execute timeouts via Twitch Helix API (bot calls Helix directly)
+- Subscribe to Redis for instant config updates
+- HMAC-signed calls to Workers only on cache misses
+
+**State Machine**:
 ```javascript
-// Dynamic token management
-const tokenData = await this.getTokenFromWorker();
+// On OAuth Connect
+NotConnected → Standby (joins channel, passive)
 
-// Message processing
-this.bot.on('privmsg', this.handleMessage.bind(this));
+// Via Dashboard or Chat Commands  
+Standby ↔ Enforcing (instant via Redis)
 
-// Auto-recovery
-this.handleConnectionError(error);
+// Only on revoke/disconnect
+Standby/Enforcing → NotConnected (leaves channel)
 ```
 
 ### **2. Bot Worker (Cloudflare Workers)**
 **File**: `Backend/workers/elowardbot/bot-worker.ts`
 
-- **Purpose**: Central business logic and token management
-- **Responsibilities**:
-  - Store and refresh Twitch OAuth tokens
-  - Provide fresh tokens to IRC bot via `/token` endpoint
-  - Process messages via `/check-message` endpoint
-  - Execute timeouts via Twitch Helix API
-  - Manage channel configuration
-  - Scheduled maintenance (daily at 3 AM UTC)
+**Purpose**: Central control plane for bot operations
 
-**Key Endpoints**:
+**Key Responsibilities**:
+- OAuth token management and automatic refresh
+- Process bot configuration updates from Dashboard
+- Serve read-through endpoints for config/ranks to bot
+- Publish config updates to Redis for instant propagation
+- HMAC request validation from bot instances
+- Light rate limiting to protect D1
+
+**Critical Endpoints**:
 ```typescript
-GET /token              // Get current bot token
-POST /token/refresh     // Force token refresh
-POST /check-message     // Process chat message
-GET /channels          // Get channel list
-GET /irc/health        // Health check
+GET  /token                    // Bot token sync
+POST /bot/config:get           // HMAC, read config for a channel (D1)
+POST /bot/config:update        // HMAC, write config (dashboard or chat), publish Redis
+POST /rank:get                 // HMAC, read lol_ranks for a user (D1)
+GET  /channels                 // Active channel list for ops
 ```
 
-### **3. Supporting Infrastructure**
+### **3. Dashboard Integration** 
+**File**: `EloWardSite/src/pages/Dashboard.js`
 
-**Rank Worker** (`Backend/workers/ranks/`):
-- Validates user League of Legends ranks
-- Integrates with Riot Games API
-- Database queries for user data
+**Flow**: Dashboard → Pages Functions → Bot Worker → D1 → Redis Pub/Sub → Bot (1-3s)
 
-**Users Worker** (`Backend/workers/users/`):
-- Manages channel configuration
-- User registration and preferences
+**Features**:
+- Real-time bot enable/disable toggle
+- Configuration: timeout duration, reason template, enforcement mode
+- Minimum rank settings (Iron → Challenger)
+- OAuth Connect flow for broadcaster permissions
 
-## 🔐 **Token Management System**
+### **4. Chat Commands**
 
-### **Production-Grade Token Sync**
+**Syntax**: `!eloward <command> [args]`
 
-The bot uses a **dual-layer refresh system** for maximum reliability:
+**Permissions**: Broadcaster + Moderators only
 
-#### **Layer 1: Proactive Maintenance (CF Worker Cron)**
-```typescript
-// Runs daily at 3 AM UTC
-async scheduled(event: ScheduledEvent) {
-  if (expiresInHours < 12) {
-    await refreshBotToken(env, refreshToken); // Refresh during low-traffic
-  }
-}
+**Supported Commands**:
+```bash
+!eloward on                    # Enable enforcement
+!eloward off                   # Disable (standby mode)
+!eloward mode hasrank          # Require any connected rank
+!eloward mode minrank gold 4   # Require Gold 4 or higher
+!eloward timeout 30            # Set timeout duration (seconds)
 ```
 
-#### **Layer 2: Reactive Safety Net (IRC Bot)**
+**Processing Flow**: Chat Command → Bot (validates mod/broadcaster) → Worker (/bot/config:update) → D1 → Redis → All Bots (1-3s)
+
+## 🚀 **Performance & Caching**
+
+### **Hot Path Optimization (Message Processing)**
+
+**Target**: ~200-400ms decision time per message
+
+**Caching Strategy**:
+- ✅ **Positive cache only**: Config (1-2s TTL), Rank (30-60s TTL)  
+- ❌ **No negative caching**: New users see effects immediately
+- 🔄 **Cache invalidation**: Via Redis pub/sub on updates
+
+**Decision Flow**:
 ```javascript
-// Checks every 15 minutes
-setInterval(() => {
-  if (expiresInMinutes < 120) {
-    await this.refreshToken(); // Get fresh token from CF Worker
-  }
-}, 15 * 60 * 1000);
+1. Check local config cache (1-2s TTL) → Cache hit = instant decision
+2. On miss: HMAC call to /bot/config:get → D1 → Update cache
+3. Check local rank cache (30-60s TTL) → Cache hit = instant decision
+4. On miss: HMAC call to /rank:get → D1 → Update cache
+5. Apply decision locally: timeout via Helix API or allow (fail-open on errors)
 ```
 
-### **Token Flow**
-1. **CF Worker** maintains OAuth tokens in KV storage
-2. **IRC Bot** requests fresh tokens via `GET /token`
-3. **Automatic refresh** when tokens expire within thresholds
-4. **Seamless reconnection** only when token actually changes
-5. **Manual override** available via `POST /token/refresh`
+### **Config Propagation (Dashboard/Chat Updates)**
 
-## 🚀 **Deployment**
+**Target**: 1-3 seconds end-to-end
 
-### **Prerequisites**
-- AWS Lightsail instance (running)
-- Cloudflare Workers deployment
-- SSH key for server access
-- Valid Twitch OAuth tokens
-
-### **Deploy CF Workers**
-```bash
-cd Backend/workers/elowardbot
-wrangler deploy
+**Flow**:
+```
+Dashboard/Chat → Worker (/bot/config:update) → D1 Write → Redis Publish → Bot Cache Invalidate → Effect
 ```
 
-### **Deploy IRC Bot**
-```bash
-cd EloWardBot
-npm run deploy
-```
-
-The deployment script:
-1. Copies `bot.js` and `package.json` to server
-2. Creates `.env` file with CF Worker URL
-3. Installs dependencies via npm
-4. Starts bot with PM2 for process management
-5. Configures auto-restart on server reboot
-
-## 📊 **Monitoring & Operations**
-
-### **Health Checks**
-```bash
-# CF Worker health
-curl -s https://eloward-bot.unleashai.workers.dev/irc/health | jq .
-
-# IRC Bot logs
-npm run logs
-
-# Server status
-ssh -i ./eloward-twitch-bot-key.pem bitnami@IP 'pm2 status'
-```
-
-### **Expected Health Response**
+**Redis Message Format**:
 ```json
 {
-  "connected": true,
-  "ready": true,
-  "channels": 1,
-  "messagesProcessed": 127,
-  "timeoutsIssued": 3,
-  "connectionAge": 45000,
-  "botLogin": "elowardbot",
-  "timestamp": "2025-09-20T04:12:41.234Z"
+  "type": "config_update",
+  "channel_login": "streamername", 
+  "fields": {"bot_enabled": true, "enforcement_mode": "minrank", "min_rank_tier": "GOLD"},
+  "version": 1640995200,
+  "updated_at": "2025-01-15T12:00:00Z"
 }
 ```
 
-### **Key Metrics**
-- `connected`: IRC connection status
-- `messagesProcessed`: Total messages handled
-- `timeoutsIssued`: Successful timeout commands
-- `connectionAge`: Uptime in milliseconds
-- `reconnectAttempts`: Should be 0 or very low
+### **Twitch Limits & Connection Strategy**
 
-## 🐛 **Troubleshooting**
+**JOIN Rate Limits**:
+- Max 20 channels per 10 seconds per connection
+- Bot throttles joins on startup to stay well under limits
 
-### **Common Issues**
+**Connection Strategy**:
+- Single IRC connection handles 150+ channels efficiently  
+- Shard to multiple connections only if needed (>200 channels)
+- Fast `!eloward` prefix check in Standby mode (minimal CPU)
 
-**Bot Not Connecting**:
-```bash
-# Check token status
-curl -s https://eloward-bot.unleashai.workers.dev/token
+**Required Helix Scopes**:
+- `moderator:manage:chat_messages` - For timeout/ban actions
+- `channel:moderate` - For reading mod status  
+- Bot handles 429 rate limits with exponential backoff
 
-# Force token refresh
-curl -X POST https://eloward-bot.unleashai.workers.dev/token/refresh
+## 🔐 **Security (Open Source Safe)**
+
+### **Zero Inbound Attack Surface**
+- ❌ **No open ports** on bot instances
+- ✅ **Outbound only**: Twitch IRC, CF Workers HTTPS, Upstash Redis TLS
+- ✅ **ECS Fargate**: Managed, patched, isolated containers
+
+### **HMAC Request Security**
+```javascript
+// Bot → Worker requests are HMAC-SHA256 signed
+const signature = hmac_sha256(secret, timestamp + method + path + body);
+headers['X-HMAC-Signature'] = signature;
+headers['X-Timestamp'] = timestamp; // 60s window
 ```
 
-**Messages Not Processing**:
+**Benefits**:
+- Prevents replay attacks (timestamp window)
+- Works with open source (secrets in env only)
+- Standard cryptographic approach
+- Lightweight validation
+
+### **Secrets Management**
+- **Bot Tokens**: CF KV (encrypted at rest)
+- **HMAC Keys**: Environment variables only  
+- **Database**: D1 with CF security model
+- **Redis**: Upstash TLS + auth token
+
+### **Threat Model Summary**
+- **No inbound ports** → Port scan/DDoS resistant  
+- **HMAC (60s window)** → Replay attack resistant
+- **Worker rate limits** → D1 protection from abuse
+
+## 📊 **Monitoring & Health**
+
+### **Key Metrics**
+- **Message Decision Time**: p95 < 400ms
+- **Config Propagation**: p95 < 3s  
+- **Timeout Success Rate**: > 98%
+- **IRC Connection Uptime**: > 99.9%
+- **Redis Notification Latency**: < 500ms
+
+### **Health Endpoints**
 ```bash
-# Check CF Worker health
+# Worker Health
 curl -s https://eloward-bot.unleashai.workers.dev/irc/health
 
-# Check bot logs
-npm run logs
+# Expected Response
+{
+  "worker_status": "healthy",
+  "architecture": "fargate_redis",  
+  "enabled_channels": 5,
+  "timestamp": "2025-01-15T10:30:00Z"
+}
 ```
 
-**Token Expired**:
+### **Bot Observability**
 ```bash
-# Automatic refresh should handle this, but manual override:
-curl -X POST https://eloward-bot.unleashai.workers.dev/token/refresh
+# ECS Logs via CloudWatch
+aws logs tail /ecs/eloward-bot --follow
+
+# Key Log Patterns
+✅ [INFO] Redis notification received: config_update channel:streamer
+✅ [INFO] Message decision: allow user:player channel:streamer (45ms)
+⚡ [INFO] Config updated: enforcement_mode=minrank (Redis→Cache)
+🔍 [WARN] Rank cache miss: player (fetching fresh)
 ```
 
-### **Log Patterns**
+## 🌍 **Multi-Region Architecture**
 
-**✅ Healthy Operation**:
-```
-✅ Connected to Twitch IRC successfully!
-✅ Joined 1 channels: [ 'channelname' ]
-🔍 Token health check { expiresInMinutes: 720, needsRefresh: false }
-✅ Processed message for user in channel: timeout
+### **Phase 1: North America (Launch)**
+- **ECS Fargate**: `us-east-1` (closest to CF edge)
+- **Target**: US/Canada streamers
+- **Channels**: Auto-assigned based on streamer geo-hint
+
+### **Phase 2: Europe (Future)**
+- **ECS Fargate**: `eu-west-1` 
+- **Target**: EU streamers
+- **Coordination**: Redis lease per channel prevents double-moderation
+
+### **Channel Assignment**
+```sql
+-- D1 Schema Enhancement
+ALTER TABLE bot_channels ADD COLUMN preferred_region TEXT DEFAULT 'na';
+
+-- Assignment Logic (in Worker)
+const region = request.cf.country in ['US','CA'] ? 'na' : 'eu';
 ```
 
-**❌ Issues to Watch**:
-```
-❌ Token request failed: { status: 500 }
-❌ Reconnection attempt 3 failed
-❌ CF Worker responded with 500
-🔄 Token needs refresh - syncing with CF Worker
+## 🚀 **Deployment Guide**
+
+### **Prerequisites**
+- AWS Account with ECS permissions
+- Cloudflare account with Workers/D1 access
+- Upstash Redis database
+- Twitch Developer Application
+
+### **1. Cloudflare Setup**
+```bash
+# Deploy Bot Worker
+cd Backend/workers/elowardbot
+wrangler deploy
+
+# Configure Environment Variables
+wrangler secret put TWITCH_CLIENT_ID
+wrangler secret put TWITCH_CLIENT_SECRET  
+wrangler secret put BOT_WRITE_KEY
+wrangler secret put UPSTASH_REDIS_URL
+wrangler secret put UPSTASH_REDIS_TOKEN
 ```
 
-## 🔧 **Development**
+### **2. D1 Database Schema**
+```sql
+-- bot_channels: add columns for region assignment and change tracking
+ALTER TABLE bot_channels ADD COLUMN preferred_region TEXT DEFAULT 'us-east-1';
+ALTER TABLE bot_channels ADD COLUMN updated_at INTEGER DEFAULT (strftime('%s', 'now'));
+
+-- Performance indexes
+CREATE INDEX idx_bot_channels_enabled ON bot_channels(bot_enabled);
+CREATE INDEX idx_lol_ranks_username ON lol_ranks(twitch_username);
+
+-- Trigger to update timestamp on changes
+CREATE TRIGGER update_bot_channels_timestamp 
+  AFTER UPDATE ON bot_channels
+  BEGIN UPDATE bot_channels SET updated_at = strftime('%s', 'now') WHERE twitch_id = NEW.twitch_id; END;
+```
+
+### **3. Upstash Redis Setup**
+```bash
+# Create Redis instance at console.upstash.com
+# Enable TLS, get connection details
+# Add to CF Worker environment:
+UPSTASH_REDIS_URL=https://your-redis.upstash.io
+UPSTASH_REDIS_TOKEN=your-token
+```
+
+### **4. ECS Fargate Deployment**
+```bash
+# Build and push container
+docker build -t eloward-bot .
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 123456789012.dkr.ecr.us-east-1.amazonaws.com
+docker tag eloward-bot:latest 123456789012.dkr.ecr.us-east-1.amazonaws.com/eloward-bot:latest
+docker push 123456789012.dkr.ecr.us-east-1.amazonaws.com/eloward-bot:latest
+
+# Deploy ECS Service
+aws ecs create-service --cluster eloward --service-name eloward-bot \
+  --task-definition eloward-bot:1 --desired-count 1
+```
+
+### **5. Environment Configuration**
+```bash
+# ECS Task Environment Variables
+CF_WORKER_URL=https://eloward-bot.unleashai.workers.dev
+HMAC_SECRET=your-shared-secret-here
+UPSTASH_REDIS_URL=your-redis-url
+UPSTASH_REDIS_TOKEN=your-redis-token
+AWS_REGION=us-east-1
+```
+
+## 🔧 **Development Workflow**
 
 ### **Local Development**
 ```bash
 # Install dependencies
 npm install
 
-# Set environment variables
-echo "CF_WORKER_URL=https://eloward-bot.unleashai.workers.dev" > .env
+# Set up environment
+cp .env.example .env
+# Configure CF_WORKER_URL and other secrets
 
 # Run locally (connects to production CF Worker)
 npm start
 ```
 
-### **Development Workflow**
-1. **Edit code** in `bot.js`
-2. **Test locally** with production CF Worker
-3. **Deploy to server** with `npm run deploy`
-4. **Monitor logs** with `npm run logs`
-
-### **Configuration**
-
-**Environment Variables** (`.env`):
+### **Testing Changes**
 ```bash
-CF_WORKER_URL=https://eloward-bot.unleashai.workers.dev
-```
-
-**Server Configuration** (`deploy.sh`):
-```bash
-SERVER_USER="bitnami"
-SERVER_IP="35.94.69.109"
-SSH_KEY="./eloward-twitch-bot-key.pem"
-APP_DIR="/home/bitnami/elowardbot"
-```
-
-## 📈 **Performance & Scale**
-
-### **Current Capacity**
-- **Channels**: Dynamically loaded from database
-- **Messages**: Handles high-volume chat processing
-- **Response Time**: Fast message processing via edge network
-- **Uptime**: Automatic recovery and reconnection
-
-### **Scaling Considerations**
-- **IRC Bot**: Single instance handles multiple channels
-- **CF Workers**: Auto-scale with demand
-- **Database**: D1 handles concurrent queries efficiently
-
-## 🛡️ **Security & Reliability**
-
-### **Token Security**
-- ✅ OAuth tokens stored securely in CF KV
-- ✅ Automatic token refresh with exponential backoff
-- ✅ No hardcoded secrets in code
-- ✅ Tokens synced dynamically, never exposed in logs
-
-### **Error Handling**
-- ✅ Exponential backoff for reconnections
-- ✅ Circuit breaker for failed API calls
-- ✅ Graceful degradation on service outages
-- ✅ Comprehensive logging for debugging
-
-### **Production Safeguards**
-- ✅ Dual-layer token refresh system
-- ✅ Health monitoring and alerting
-- ✅ Automatic recovery from failures
-- ✅ Zero-downtime deployments
-- ✅ Maintenance during low-traffic hours
-
-## 📝 **API Documentation**
-
-### **CF Worker Endpoints**
-
-#### `GET /token`
-Get current bot OAuth token for IRC connection.
-
-**Response**:
-```json
-{
-  "token": "oauth:abc123...",
-  "user": { "login": "elowardbot", "id": "123" },
-  "expires_at": 1758341255703,
-  "expires_in_minutes": 840,
-  "needs_refresh_soon": false
-}
-```
-
-#### `POST /check-message`
-Process a chat message and determine if user should be timed out.
-
-**Request**:
-```json
-{
-  "channel": "streamername",
-  "user": "chattername", 
-  "message": "hello world"
-}
-```
-
-**Response**:
-```json
-{
-  "action": "timeout",
-  "reason": "insufficient rank",
-  "duration": 20
-}
-```
-
-#### `GET /channels`
-Get list of channels bot should be monitoring.
-
-**Response**:
-```json
-{
-  "channels": ["channel1", "channel2"],
-  "count": 2,
-  "timestamp": "2025-09-20T04:12:41.234Z"
-}
-```
-
-## 🤝 **Contributing**
-
-1. Fork the repository
-2. Create a feature branch
-3. Test changes locally
-4. Deploy to staging environment
-5. Submit pull request with detailed description
-
-### **Development Setup**
-```bash
-git clone <repo>
-cd EloWardBot
-npm install
-cp .env.example .env  # Configure CF Worker URL
+# 1. Test bot logic locally
 npm start
+
+# 2. Deploy Worker changes  
+cd Backend/workers/elowardbot && wrangler deploy
+
+# 3. Build and deploy container
+docker build -t eloward-bot . && ./deploy-fargate.sh
+
+# 4. Monitor logs
+aws logs tail /ecs/eloward-bot --follow
 ```
+
+## 📈 **Scale & Performance Targets**
+
+### **Current Capacity (Single Fargate Task)**
+- **Channels**: 150+ in Standby, 30 actively Enforcing
+- **Messages**: 750 msgs/sec aggregate (5 msgs/sec × 150 channels)  
+- **Bandwidth**: ~1.2 Mbps inbound (totally manageable)
+- **Memory**: < 100MB (minimal per-channel state)
+- **CPU**: < 5% utilization at peak
+
+### **Scaling Strategy**
+```bash
+# Horizontal scaling (if needed)
+# Option 1: Increase ECS desired count
+aws ecs update-service --cluster eloward --service eloward-bot --desired-count 2
+
+# Option 2: Add second region  
+# Deploy eu-west-1 task, use preferred_region for assignment
+```
+
+### **Performance Optimizations**
+- **IRC Connection Sharding**: 50-100 channels per connection
+- **Rate Limited Joins**: 15-20 channels per 10s window
+- **Fast Command Parsing**: `startsWith('!eloward')` early exit
+- **Connection Pooling**: Reuse HTTP connections to CF Workers
+
+## 🐛 **Troubleshooting**
+
+### **Common Issues**
+
+**Bot Not Joining Channels**:
+```bash
+# Check ECS task status
+aws ecs describe-services --cluster eloward --services eloward-bot
+
+# Check logs  
+aws logs tail /ecs/eloward-bot --since 5m
+
+# Check Redis connectivity
+redis-cli -u $UPSTASH_REDIS_URL ping
+```
+
+**Config Updates Not Propagating**:
+```bash
+# Check Redis pub/sub
+redis-cli -u $UPSTASH_REDIS_URL monitor
+
+# Check Worker logs
+wrangler tail eloward-bot
+
+# Test HMAC endpoint directly
+curl -X POST https://eloward-bot.unleashai.workers.dev/bot/config_internal \
+  -H "X-HMAC-Signature: $(generate_hmac)" \
+  -d '{"twitch_id":"123","bot_enabled":true}'
+```
+
+**Slow Message Decisions**:
+```bash
+# Check cache hit rates in logs
+aws logs filter-log-events --log-group-name /ecs/eloward-bot \
+  --filter-pattern "cache_miss"
+
+# Check Worker response times
+wrangler tail eloward-bot | grep "check-message"
+```
+
+### **Emergency Procedures**
+
+**Disable All Timeouts**:
+```sql
+-- Emergency stop via D1 console
+UPDATE bot_channels SET bot_enabled = 0 WHERE bot_enabled = 1;
+```
+
+**Rollback Deployment**:
+```bash
+# Revert to previous ECS task definition
+aws ecs update-service --cluster eloward --service eloward-bot \
+  --task-definition eloward-bot:previous-version
+```
+
+## 🎯 **Success Metrics**
+
+### **User Experience**
+- ✅ `!eloward on` takes effect in < 3 seconds
+- ✅ New account links stop timeouts on next message  
+- ✅ Dashboard toggles propagate in < 2 seconds
+- ✅ Chat commands work for all mods/broadcaster
+
+### **Technical Performance** 
+- ✅ Message decisions in < 400ms p95
+- ✅ 99.9%+ IRC connection uptime
+- ✅ < 1% timeout API failure rate
+- ✅ Zero security incidents (no exposed ports)
+
+### **Business Impact**
+- ✅ Drives account connections to EloWard
+- ✅ Increases premium badge engagement  
+- ✅ Creates positive stream experience
+- ✅ Scales to support growth
+
+---
 
 ## 📄 **License**
 
 Apache 2.0 + Commons Clause - see LICENSE file for details.
 
-## 🆘 **Support**
+## 🆘 **Support** 
 
-- **Issues**: GitHub Issues
-- **Documentation**: This README + inline comments
-- **Monitoring**: CF Worker health endpoints
-- **Logs**: PM2 logs on AWS Lightsail server
+- **Issues**: GitHub Issues tracker
+- **Documentation**: This README + inline code comments
+- **Monitoring**: CloudWatch dashboards + Upstash analytics
+- **Emergency**: Bot can be disabled instantly via D1 console
 
 ---
 
-**The EloWardBot provides automated Twitch chat moderation based on League of Legends rank requirements.**
+**EloWardBot: Production-grade Twitch chat moderation that drives user engagement and account connections through smart rank enforcement.**
