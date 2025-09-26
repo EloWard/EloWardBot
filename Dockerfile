@@ -25,8 +25,8 @@ USER elowardbot
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
   CMD node -e "console.log('Bot health: OK')" || exit 1
 
-# No exposed ports (outbound connections only)
-EXPOSE
+# No exposed ports needed - bot only makes outbound connections
+# (Twitch IRC, Cloudflare Workers, Upstash Redis)
 
 # Start the bot
 CMD ["node", "bot.js"]
