@@ -70,13 +70,86 @@ echo "🚀 Deploying to ECS Fargate..."
 SERVICE_EXISTS=$(aws ecs describe-services --cluster $CLUSTER_NAME --services $SERVICE_NAME --region $AWS_REGION --query 'services[0].serviceName' --output text 2>/dev/null)
 
 if [ "$SERVICE_EXISTS" = "$SERVICE_NAME" ]; then
-  echo "✅ ECS service exists, updating with new image..."
+  echo "✅ ECS service exists, creating new task definition with current .env values..."
   
-  # Update ECS service to use new image
+  # Create new task definition with current environment variables
+  echo "🔧 Generating task definition with latest configuration..."
+  
+  cat > task-definition-deploy.json <<EOF
+{
+  "family": "$TASK_FAMILY",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::659066864277:role/eloward-bot-execution-role",
+  "containerDefinitions": [
+    {
+      "name": "$TASK_FAMILY",
+      "image": "$FULL_IMAGE_URI",
+      "essential": true,
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/$TASK_FAMILY",
+          "awslogs-region": "$AWS_REGION",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "environment": [
+        {
+          "name": "CF_WORKER_URL",
+          "value": "${CF_WORKER_URL}"
+        },
+        {
+          "name": "AWS_REGION", 
+          "value": "${AWS_REGION}"
+        },
+        {
+          "name": "HMAC_SECRET",
+          "value": "${HMAC_SECRET}"
+        },
+        {
+          "name": "UPSTASH_REDIS_URL",
+          "value": "${UPSTASH_REDIS_URL}"
+        },
+        {
+          "name": "UPSTASH_REDIS_PASSWORD",
+          "value": "${UPSTASH_REDIS_PASSWORD}"
+        },
+        {
+          "name": "TWITCH_CLIENT_ID",
+          "value": "${TWITCH_CLIENT_ID}"
+        }
+      ]
+    }
+  ]
+}
+EOF
+
+  echo "📝 Registering new task definition..."
+  TASK_DEF_ARN=$(aws ecs register-task-definition \
+    --cli-input-json file://task-definition-deploy.json \
+    --region $AWS_REGION \
+    --query 'taskDefinition.taskDefinitionArn' \
+    --output text)
+
+  if [ $? -ne 0 ]; then
+    echo "❌ Task definition registration failed"
+    exit 1
+  fi
+
+  # Clean up temp file
+  rm -f task-definition-deploy.json
+
+  echo "✅ New task definition registered: $TASK_DEF_ARN"
+
+  # Update ECS service to use new task definition
+  echo "🔄 Updating service to use new task definition..."
   aws ecs update-service \
     --cluster $CLUSTER_NAME \
     --service $SERVICE_NAME \
-    --force-new-deployment \
+    --task-definition $TASK_DEF_ARN \
     --region $AWS_REGION
 
   if [ $? -ne 0 ]; then
@@ -96,28 +169,24 @@ else
   exit 0
 fi
 
-echo "⏱️ Waiting for deployment to complete..."
-aws ecs wait services-stable \
-  --cluster $CLUSTER_NAME \
-  --services $SERVICE_NAME \
-  --region $AWS_REGION
-
-if [ $? -eq 0 ]; then
-  echo "✅ Deployment completed successfully!"
-else
-  echo "⚠️ Deployment may still be in progress. Check ECS console for status."
-fi
+echo "⏱️ Deployment initiated! Checking initial status..."
+sleep 5
 
 echo ""
-echo "📊 Service Status:"
+echo "📊 Current Service Status:"
 aws ecs describe-services \
   --cluster $CLUSTER_NAME \
   --services $SERVICE_NAME \
   --region $AWS_REGION \
-  --query 'services[0].{Status:status,Running:runningCount,Desired:desiredCount}' \
+  --query 'services[0].{Desired:desiredCount,Running:runningCount,Status:status,LatestDeployment:deployments[0].rolloutState}' \
   --output table
 
 echo ""
-echo "📋 Deployment Complete!"
+echo "✅ Deployment Successfully Initiated!"
+echo ""
+echo "📋 Next Steps:"
 echo "🔍 Monitor logs: aws logs tail /ecs/elowardbot --follow --region $AWS_REGION"
+echo "📊 Check status: aws ecs describe-services --cluster $CLUSTER_NAME --services $SERVICE_NAME --region $AWS_REGION"
 echo "📊 ECS Console: https://${AWS_REGION}.console.aws.amazon.com/ecs/home?region=${AWS_REGION}#/clusters/${CLUSTER_NAME}/services"
+echo ""
+echo "⏳ Deployment typically takes 1-3 minutes to complete."
