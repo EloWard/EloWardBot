@@ -39,7 +39,7 @@ EloWardBot creates a funnel to drive Twitch viewers to connect their League of L
 │  • Containerized IRC Bot       • us-east-1 (primary)       │
 │  • No Inbound Ports           • eu-west-1 (future)        │
 │  • Auto-restart/Scale         • preferred_region in D1     │  
-│  • Outbound Only              • Redis Lease Coordination   │
+│  • Outbound Only              • Logical region assignment (na/eu)│
 │                                                             │
 │              🤖 IRC Connection                              │
 │              • Persistent to irc.chat.twitch.tv            │
@@ -128,6 +128,8 @@ GET  /channels                 // Active channel list for ops
 
 **Permissions**: Broadcaster + Moderators only
 
+**Enforcement Ignore List**: Bot ignores broadcaster/mods (and optionally VIPs/subs if configured) for enforcement
+
 **Supported Commands**:
 ```bash
 !eloward on                    # Enable enforcement
@@ -173,11 +175,13 @@ Dashboard/Chat → Worker (/bot/config:update) → D1 Write → Redis Publish �
 {
   "type": "config_update",
   "channel_login": "streamername", 
-  "fields": {"bot_enabled": true, "enforcement_mode": "minrank", "min_rank_tier": "GOLD"},
-  "version": 1640995200,
-  "updated_at": "2025-01-15T12:00:00Z"
+  "fields": {"bot_enabled": true, "enforcement_mode": "minrank", "min_rank": "GOLD4"},
+  "version": 1737849600,
+  "updated_at": "2025-01-25T12:00:00Z"
 }
 ```
+
+**Version Handling**: Bot ignores messages if `version <= cached_version` to prevent race conditions.
 
 ### **Twitch Limits & Connection Strategy**
 
@@ -186,14 +190,20 @@ Dashboard/Chat → Worker (/bot/config:update) → D1 Write → Redis Publish �
 - Bot throttles joins on startup to stay well under limits
 
 **Connection Strategy**:
-- Single IRC connection handles 150+ channels efficiently  
-- Shard to multiple connections only if needed (>200 channels)
+- Two IRC connections (75-80 channels each) for resilience
 - Fast `!eloward` prefix check in Standby mode (minimal CPU)
+- Exponential backoff + jitter on reconnection to prevent storms
 
 **Required Helix Scopes**:
-- `moderator:manage:chat_messages` - For timeout/ban actions
-- `channel:moderate` - For reading mod status  
-- Bot handles 429 rate limits with exponential backoff
+- `moderator:manage:banned_users` - For timeout/ban actions via `/moderation/bans`
+- `channel:moderate` - For mod/broadcaster context
+- If we also delete messages, add `moderator:manage:chat_messages`
+- Respect Twitch Helix rate buckets (per-user/app); on `429`, use exponential backoff + jitter
+
+**Self-Healing**:
+- Every 60-120s: lightweight reconcile sweep (check `updated_at` for stale cache)
+- Sweep checks only channel `updated_at/version` to avoid heavy reads; full config fetch only when stale
+- Prevents missed Redis pub/sub messages during brief disconnects
 
 ## 🔐 **Security (Open Source Safe)**
 
@@ -207,7 +217,7 @@ Dashboard/Chat → Worker (/bot/config:update) → D1 Write → Redis Publish �
 // Bot → Worker requests are HMAC-SHA256 signed
 const signature = hmac_sha256(secret, timestamp + method + path + body);
 headers['X-HMAC-Signature'] = signature;
-headers['X-Timestamp'] = timestamp; // 60s window
+headers['X-Timestamp'] = timestamp; // Allow ±60s clock skew; reject outside window
 ```
 
 **Benefits**:
@@ -229,25 +239,27 @@ headers['X-Timestamp'] = timestamp; // 60s window
 
 ## 📊 **Monitoring & Health**
 
-### **Key Metrics**
-- **Message Decision Time**: p95 < 400ms
-- **Config Propagation**: p95 < 3s  
-- **Timeout Success Rate**: > 98%
-- **IRC Connection Uptime**: > 99.9%
-- **Redis Notification Latency**: < 500ms
+### **Key Metrics (Essential 3)**
+- **message_decision_ms_p95**: < 400ms (local cache hit performance)
+- **config_propagation_ms_p95**: < 3s (Redis pub → cache invalidation)  
+- **helix_timeout_failure_rate**: < 2% (API success rate)
 
 ### **Health Endpoints**
 ```bash
 # Worker Health
 curl -s https://eloward-bot.unleashai.workers.dev/irc/health
 
-# Expected Response
+# Expected Response (Control Plane Health)
 {
   "worker_status": "healthy",
   "architecture": "fargate_redis",  
   "enabled_channels": 5,
+  "d1_status": "operational",
+  "redis_status": "connected",
   "timestamp": "2025-01-15T10:30:00Z"
 }
+
+# IRC socket health is observed via bot logs/metrics; the Worker reports only control-plane status
 ```
 
 ### **Bot Observability**
@@ -266,17 +278,17 @@ aws logs tail /ecs/eloward-bot --follow
 
 ### **Phase 1: North America (Launch)**
 - **ECS Fargate**: `us-east-1` (closest to CF edge)
+- **Logical Region**: `na` in D1
 - **Target**: US/Canada streamers
-- **Channels**: Auto-assigned based on streamer geo-hint
 
 ### **Phase 2: Europe (Future)**
 - **ECS Fargate**: `eu-west-1` 
+- **Logical Region**: `eu` in D1
 - **Target**: EU streamers
-- **Coordination**: Redis lease per channel prevents double-moderation
 
 ### **Channel Assignment**
 ```sql
--- D1 Schema Enhancement
+-- D1 uses logical regions
 ALTER TABLE bot_channels ADD COLUMN preferred_region TEXT DEFAULT 'na';
 
 -- Assignment Logic (in Worker)
@@ -308,26 +320,31 @@ wrangler secret put UPSTASH_REDIS_TOKEN
 ### **2. D1 Database Schema**
 ```sql
 -- bot_channels: add columns for region assignment and change tracking
-ALTER TABLE bot_channels ADD COLUMN preferred_region TEXT DEFAULT 'us-east-1';
-ALTER TABLE bot_channels ADD COLUMN updated_at INTEGER DEFAULT (strftime('%s', 'now'));
+ALTER TABLE bot_channels ADD COLUMN preferred_region TEXT DEFAULT 'na';
+ALTER TABLE bot_channels ADD COLUMN updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'));
+ALTER TABLE bot_channels ADD COLUMN version INTEGER NOT NULL DEFAULT (strftime('%s','now'));
 
 -- Performance indexes
 CREATE INDEX idx_bot_channels_enabled ON bot_channels(bot_enabled);
-CREATE INDEX idx_lol_ranks_username ON lol_ranks(twitch_username);
+CREATE INDEX idx_lol_ranks_user_login ON lol_ranks(user_login);
 
--- Trigger to update timestamp on changes
-CREATE TRIGGER update_bot_channels_timestamp 
-  AFTER UPDATE ON bot_channels
-  BEGIN UPDATE bot_channels SET updated_at = strftime('%s', 'now') WHERE twitch_id = NEW.twitch_id; END;
+-- updated_at and version are set by the Worker on every write (monotonic epoch ms preferred)
+-- No DB triggers used
 ```
 
 ### **3. Upstash Redis Setup**
 ```bash
 # Create Redis instance at console.upstash.com
 # Enable TLS, get connection details
-# Add to CF Worker environment:
-UPSTASH_REDIS_URL=https://your-redis.upstash.io
-UPSTASH_REDIS_TOKEN=your-token
+# Workers use REST; the bot uses the Redis protocol (TLS)
+
+# CF Workers (REST API):
+UPSTASH_REDIS_REST_URL=https://your-redis.upstash.io
+UPSTASH_REDIS_REST_TOKEN=your-rest-token
+
+# Bot (Redis Protocol):
+UPSTASH_REDIS_URL=rediss://your-host:6380
+UPSTASH_REDIS_PASSWORD=your-password
 ```
 
 ### **4. ECS Fargate Deployment**
@@ -348,8 +365,8 @@ aws ecs create-service --cluster eloward --service-name eloward-bot \
 # ECS Task Environment Variables
 CF_WORKER_URL=https://eloward-bot.unleashai.workers.dev
 HMAC_SECRET=your-shared-secret-here
-UPSTASH_REDIS_URL=your-redis-url
-UPSTASH_REDIS_TOKEN=your-redis-token
+UPSTASH_REDIS_URL=rediss://your-host:6380
+UPSTASH_REDIS_PASSWORD=your-password
 AWS_REGION=us-east-1
 ```
 
@@ -391,6 +408,7 @@ aws logs tail /ecs/eloward-bot --follow
 - **Bandwidth**: ~1.2 Mbps inbound (totally manageable)
 - **Memory**: < 100MB (minimal per-channel state)
 - **CPU**: < 5% utilization at peak
+- **IRC Connections**: 2 concurrent connections by default for resilience; both use JOIN throttling (≤20/10s)
 
 ### **Scaling Strategy**
 ```bash
@@ -433,9 +451,10 @@ redis-cli -u $UPSTASH_REDIS_URL monitor
 wrangler tail eloward-bot
 
 # Test HMAC endpoint directly
-curl -X POST https://eloward-bot.unleashai.workers.dev/bot/config_internal \
+curl -X POST https://eloward-bot.unleashai.workers.dev/bot/config:update \
   -H "X-HMAC-Signature: $(generate_hmac)" \
-  -d '{"twitch_id":"123","bot_enabled":true}'
+  -H "Content-Type: application/json" \
+  -d '{"channel_login":"streamer","fields":{"bot_enabled":true}}'
 ```
 
 **Slow Message Decisions**:
@@ -445,7 +464,7 @@ aws logs filter-log-events --log-group-name /ecs/eloward-bot \
   --filter-pattern "cache_miss"
 
 # Check Worker response times
-wrangler tail eloward-bot | grep "check-message"
+wrangler tail eloward-bot | grep "config:update\|rank:get"
 ```
 
 ### **Emergency Procedures**
