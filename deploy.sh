@@ -32,8 +32,8 @@ fi
 
 echo "🏗️ Building Docker image..."
 
-# Build Docker image
-docker build -t elowardbot:latest .
+# Build Docker image for AMD64 (ECS Fargate)
+docker buildx build --platform linux/amd64 -t elowardbot:latest --load .
 
 if [ $? -ne 0 ]; then
   echo "❌ Docker build failed"
