@@ -1,96 +1,123 @@
 #!/bin/bash
 
-# Configuration
-SERVER_USER="ubuntu"  # Changed from bitnami to ubuntu for better AWS integration
-SERVER_IP="${ELOWARD_SERVER_IP:-YOUR_EC2_INSTANCE_IP}"
-SSH_KEY="./eloward-bot-key.pem"
-APP_DIR="/home/ubuntu/elowardbot"
-REDIS_HOST="${ELOWARD_REDIS_HOST:-your-redis-endpoint.cache.amazonaws.com}"
-
-echo "🚀 Deploying Enhanced EloWard Twitch Bot with AWS Messaging..."
-
-# Create app directory on server if it doesn't exist
-ssh -i $SSH_KEY $SERVER_USER@$SERVER_IP "mkdir -p $APP_DIR"
-
-# Copy files to server
-scp -i $SSH_KEY bot.js package.json $SERVER_USER@$SERVER_IP:$APP_DIR/
-
-# Create enhanced .env file on server with environment variable substitution
-ssh -i $SSH_KEY $SERVER_USER@$SERVER_IP "
-export ELOWARD_SQS_URL='$ELOWARD_SQS_URL'
-export ELOWARD_REDIS_HOST='$ELOWARD_REDIS_HOST' 
-export AWS_ACCESS_KEY_ID='$AWS_ACCESS_KEY_ID'
-export AWS_SECRET_ACCESS_KEY='$AWS_SECRET_ACCESS_KEY'
-cat > $APP_DIR/.env << EOF
-# Cloudflare Worker Integration
-CF_WORKER_URL=https://eloward-bot.unleashai.workers.dev
-
-# AWS Configuration
-AWS_REGION=us-east-2
-AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
-AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
-
-# SQS Configuration
-SQS_QUEUE_URL=$ELOWARD_SQS_URL
-
-# ElastiCache Redis Configuration  
-REDIS_HOST=$ELOWARD_REDIS_HOST
-REDIS_PORT=6379
-EOF
-"
-
-# Install dependencies and restart bot
-ssh -i $SSH_KEY $SERVER_USER@$SERVER_IP << 'EOF'
-cd /home/ubuntu/elowardbot
-
-# Update system packages
-sudo apt-get update
-
-# Install Node.js if not present
-if ! command -v node &> /dev/null; then
-    curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
-    sudo apt-get install -y nodejs
+# Load environment variables from .env file if it exists
+if [ -f .env ]; then
+  echo "📝 Loading configuration from .env file..."
+  set -a  # automatically export all variables
+  source .env
+  set +a  # stop auto-export
+else
+  echo "⚠️ No .env file found. Copy env-template.txt to .env and configure it."
+  exit 1
 fi
 
-# Install dependencies
-npm install
+# Configuration for ECS Fargate deployment (with .env overrides)
+CLUSTER_NAME="${ELOWARD_ECS_CLUSTER:-eloward}"
+SERVICE_NAME="${ELOWARD_ECS_SERVICE:-elowardbot}"
+TASK_DEFINITION="${ELOWARD_TASK_DEF:-elowardbot:1}"
+AWS_REGION="${AWS_REGION:-us-east-1}"
+ECR_REPO="${ELOWARD_ECR_REPO}"
 
-# Install AWS CLI for easier management
-if ! command -v aws &> /dev/null; then
-    sudo apt-get install -y awscli
+echo "🚀 Deploying Production EloWard Bot to AWS ECS Fargate..."
+echo "📍 Cluster: $CLUSTER_NAME"
+echo "🔧 Service: $SERVICE_NAME"
+echo "📦 Task Definition: $TASK_DEFINITION"
+
+# Verify required environment variables
+if [ -z "$ECR_REPO" ]; then
+  echo "❌ ELOWARD_ECR_REPO environment variable is required"
+  echo "Example: 123456789012.dkr.ecr.us-east-1.amazonaws.com/elowardbot"
+  exit 1
 fi
 
-# Kill existing bot process if running
-pkill -f "node bot" || true
+echo "🏗️ Building Docker image..."
 
-# Install PM2 globally if not present
-npm list -g pm2 || sudo npm install -g pm2
+# Build Docker image
+docker build -t elowardbot:latest .
 
-# Delete existing PM2 process
-pm2 delete elowardbot || true
+if [ $? -ne 0 ]; then
+  echo "❌ Docker build failed"
+  exit 1
+fi
 
-# Start bot with PM2
-pm2 start bot.js --name elowardbot
+echo "✅ Docker image built successfully"
 
-# Save PM2 configuration
-pm2 save
+echo "🔐 Logging into ECR..."
+aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REPO
 
-# Setup PM2 startup script
-pm2 startup
+if [ $? -ne 0 ]; then
+  echo "❌ ECR login failed"
+  exit 1
+fi
 
-echo "✅ Enhanced Bot deployed and running!"
-echo "📊 Bot Status:"
-pm2 status
+echo "🏷️ Tagging and pushing image..."
+IMAGE_TAG="latest"
+FULL_IMAGE_URI="$ECR_REPO:$IMAGE_TAG"
 
-echo "🔍 Recent Logs:"
-pm2 logs elowardbot --lines 20
+docker tag elowardbot:latest $FULL_IMAGE_URI
+docker push $FULL_IMAGE_URI
+
+if [ $? -ne 0 ]; then
+  echo "❌ Docker push failed"
+  exit 1
+fi
+
+echo "✅ Image pushed to ECR: $FULL_IMAGE_URI"
+
+echo "🚀 Deploying to ECS Fargate..."
+
+# Check if ECS service exists
+SERVICE_EXISTS=$(aws ecs describe-services --cluster $CLUSTER_NAME --services $SERVICE_NAME --region $AWS_REGION --query 'services[0].serviceName' --output text 2>/dev/null)
+
+if [ "$SERVICE_EXISTS" = "$SERVICE_NAME" ]; then
+  echo "✅ ECS service exists, updating with new image..."
+  
+  # Update ECS service to use new image
+  aws ecs update-service \
+    --cluster $CLUSTER_NAME \
+    --service $SERVICE_NAME \
+    --force-new-deployment \
+    --region $AWS_REGION
+
+  if [ $? -ne 0 ]; then
+    echo "❌ ECS service update failed"
+    exit 1
+  fi
+
+  echo "✅ ECS service update initiated"
+else
+  echo "⚠️ ECS service '$SERVICE_NAME' does not exist yet."
+  echo "📋 Next steps:"
+  echo "1. Run: chmod +x create-ecs-service.sh"
+  echo "2. Run: ./create-ecs-service.sh"
+  echo "3. Then run this deploy script again"
+  echo ""
+  echo "✅ Your Docker image has been successfully pushed to ECR and is ready to deploy!"
+  exit 0
+fi
+
+echo "⏱️ Waiting for deployment to complete..."
+aws ecs wait services-stable \
+  --cluster $CLUSTER_NAME \
+  --services $SERVICE_NAME \
+  --region $AWS_REGION
+
+if [ $? -eq 0 ]; then
+  echo "✅ Deployment completed successfully!"
+else
+  echo "⚠️ Deployment may still be in progress. Check ECS console for status."
+fi
 
 echo ""
-echo "🚀 Deployment complete!"
-echo "📋 Next Steps:"
-echo "1. Update AWS credentials in .env file:"
-echo "   ssh -i $SSH_KEY $SERVER_USER@$SERVER_IP 'nano $APP_DIR/.env'"
-echo "2. Set up SQS queue and ElastiCache Redis cluster"
-echo "3. Update Cloudflare Worker environment variables"
-echo "4. Monitor logs: npm run logs"
-EOF
+echo "📊 Service Status:"
+aws ecs describe-services \
+  --cluster $CLUSTER_NAME \
+  --services $SERVICE_NAME \
+  --region $AWS_REGION \
+  --query 'services[0].{Status:status,Running:runningCount,Desired:desiredCount}' \
+  --output table
+
+echo ""
+echo "📋 Deployment Complete!"
+echo "🔍 Monitor logs: aws logs tail /ecs/elowardbot --follow --region $AWS_REGION"
+echo "📊 ECS Console: https://${AWS_REGION}.console.aws.amazon.com/ecs/home?region=${AWS_REGION}#/clusters/${CLUSTER_NAME}/services"

@@ -12,7 +12,6 @@
     "irc-framework": "^4.13.0",
     "node-fetch": "^2.6.7",
     "dotenv": "^16.0.0",
-    "@aws-sdk/client-sqs": "^3.456.0",
     "ioredis": "^5.3.2"
   }
 }

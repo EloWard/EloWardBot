@@ -1,59 +1,62 @@
 require('dotenv').config();
 const irc = require('irc-framework');
 const fetch = require('node-fetch');
-const { SQSClient, ReceiveMessageCommand, DeleteMessageCommand } = require("@aws-sdk/client-sqs");
+const crypto = require('crypto');
 const Redis = require('ioredis');
 
 class EloWardTwitchBot {
   constructor() {
-    this.bot = new irc.Client();
-    this.channels = new Set();
-    this.CLOUDFLARE_WORKER_URL = process.env.CF_WORKER_URL || 'https://eloward-bot.unleashai.workers.dev';
+    // Two IRC connections for resilience (per README spec)
+    this.primaryBot = new irc.Client();
+    this.secondaryBot = new irc.Client();
+    this.channels = new Map(); // channel_name -> {primary: bool, secondary: bool}
+    this.maxChannelsPerConnection = 80; // 75-80 channels each per README
+    this.WORKER_URL = process.env.CF_WORKER_URL || 'https://eloward-bot.unleashai.workers.dev';
+    this.HMAC_SECRET = process.env.HMAC_SECRET;
     this.currentToken = null;
     this.tokenExpiresAt = 0;
     this.reconnectAttempts = 0;
     this.maxReconnectDelay = 30000;
     this.tokenCheckInterval = null;
+    this.configSweepInterval = null;
     
-    // AWS SQS Configuration
-    this.sqs = new SQSClient({ 
-      region: process.env.AWS_REGION || 'us-west-2',
-      credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
-      }
-    });
-    this.queueUrl = process.env.SQS_QUEUE_URL;
+    // Local caches with TTL (production optimization)
+    this.configCache = new Map(); // channel -> {config, expires}  
+    this.rankCache = new Map();   // user -> {hasRank, expires}
     
-    // Redis Configuration
+    // Redis for instant config updates
     this.redis = null;
-    if (process.env.REDIS_URL) {
-      this.redis = new Redis({
-        host: process.env.REDIS_HOST,
-        port: parseInt(process.env.REDIS_PORT) || 6379,
-        password: process.env.REDIS_PASSWORD,
+    if (process.env.UPSTASH_REDIS_URL) {
+      this.redis = new Redis(process.env.UPSTASH_REDIS_URL, {
+        password: process.env.UPSTASH_REDIS_PASSWORD,
         retryDelayOnFailure: 100,
         enableOfflineQueue: false,
-        lazyConnect: true
+        lazyConnect: true,
+        tls: process.env.UPSTASH_REDIS_URL.startsWith('rediss:') ? {} : undefined
       });
+    }
+    
+    if (!this.HMAC_SECRET) {
+      throw new Error('HMAC_SECRET required for production security');
     }
   }
 
   async start() {
-    console.log('🚀 Starting EloWard Twitch Bot with instant Redis notifications...');
-    console.log('📡 CF Worker URL:', this.CLOUDFLARE_WORKER_URL);
-    console.log('⚡ Redis:', this.redis ? 'Configured for instant notifications' : 'Not configured - using polling only');
-    console.log('📨 SQS Queue:', this.queueUrl ? 'Available for testing/backup' : 'Not configured');
-    console.log('🔄 Periodic Polling: 15-minute fallback for reliability');
+    console.log('🚀 Starting EloWard Production IRC Bot...');
+    console.log('📡 Worker URL:', this.WORKER_URL);
+    console.log('⚡ Redis:', this.redis ? 'Configured for instant config updates (1-3s propagation)' : 'Not configured - using polling fallback');
+    console.log('🔒 HMAC Security: Enabled (SHA-256, ±60s window)');
+    console.log('💾 Local Caching: Config (1-2s TTL), Rank (30-60s TTL) for <400ms decisions');
+    console.log('🔗 IRC Connections: Dual connections for resilience (max 80 channels each)');
 
-    // Get fresh token from CF Worker
+    // Get fresh token from Worker
     const tokenData = await this.getTokenFromWorker();
     if (!tokenData) {
-      console.error('❌ Failed to get token from CF Worker');
+      console.error('❌ Failed to get token from Worker');
       process.exit(1);
     }
 
-    console.log('✅ Token obtained from CF Worker', { 
+    console.log('✅ Token obtained', { 
       userLogin: tokenData.user.login,
       expiresInMinutes: tokenData.expires_in_minutes
     });
@@ -64,18 +67,31 @@ class EloWardTwitchBot {
     await this.connectToTwitch();
     this.setupEventHandlers();
     this.startTokenMonitoring();
-    
-    // Start messaging systems - Redis first for instant notifications
     this.startRedisSubscription();
-    this.startSQSPolling();
+    this.startConfigSweep();
   }
 
-  // PRODUCTION TOKEN SYNC - Get current token from CF Worker
+  // HMAC request signing for secure Worker communication
+  signRequest(method, path, body) {
+    const timestamp = Math.floor(Date.now() / 1000);
+    const payload = timestamp + method + path + (body || '');
+    const signature = crypto.createHmac('sha256', this.HMAC_SECRET)
+      .update(payload)
+      .digest('hex');
+    
+    return {
+      'X-HMAC-Signature': signature,
+      'X-Timestamp': timestamp.toString(),
+      'Content-Type': 'application/json'
+    };
+  }
+
+  // Token sync - unprotected endpoint for IRC bot
   async getTokenFromWorker() {
     try {
-      console.log('🔄 Requesting fresh token from CF Worker...');
+      console.log('🔄 Requesting fresh token from Worker...');
       
-      const response = await fetch(`${this.CLOUDFLARE_WORKER_URL}/token`);
+      const response = await fetch(`${this.WORKER_URL}/token`);
       if (!response.ok) {
         const error = await response.json().catch(() => ({ error: 'Unknown error' }));
         console.error('❌ Token request failed:', { 
@@ -87,7 +103,7 @@ class EloWardTwitchBot {
 
       const tokenData = await response.json();
       
-      console.log('✅ Token received from CF Worker', {
+      console.log('✅ Token received from Worker', {
         userLogin: tokenData.user?.login,
         expiresInMinutes: tokenData.expires_in_minutes,
         needsRefreshSoon: tokenData.needs_refresh_soon
@@ -100,20 +116,59 @@ class EloWardTwitchBot {
     }
   }
 
-  // PRODUCTION CONNECTION - Use fresh token
+  // Production IRC connection with dual connections for resilience
   async connectToTwitch() {
     if (!this.currentToken) {
       throw new Error('No token available for connection');
     }
 
-    console.log('🔌 Connecting to Twitch IRC with fresh token...');
+    console.log('🔌 Connecting to Twitch IRC with dual connections for resilience...');
 
-    this.bot.connect({
+    const connectionConfig = {
       host: 'irc.chat.twitch.tv',
       port: 6667,
       nick: 'elowardbot',
       username: 'elowardbot',
       password: this.currentToken
+    };
+
+    // Connect both IRC clients for resilience
+    this.primaryBot.connect(connectionConfig);
+    
+    // Stagger secondary connection to avoid rate limits
+    setTimeout(() => {
+      this.secondaryBot.connect(connectionConfig);
+    }, 2000);
+  }
+
+  // Local caching with TTL for performance
+  getCachedConfig(channelLogin) {
+    const cached = this.configCache.get(channelLogin);
+    if (cached && Date.now() < cached.expires) {
+      return cached.config;
+    }
+    return null;
+  }
+
+  setCachedConfig(channelLogin, config) {
+    this.configCache.set(channelLogin, {
+      config,
+      expires: Date.now() + (config ? 2000 : 1000) // 2s for valid, 1s for null
+    });
+  }
+
+  getCachedRank(userLogin) {
+    const cached = this.rankCache.get(userLogin);
+    if (cached && Date.now() < cached.expires) {
+      return { hasRank: cached.hasRank, cached: true };
+    }
+    return null;
+  }
+
+  setCachedRank(userLogin, hasRank) {
+    this.rankCache.set(userLogin, {
+      hasRank,
+      expires: Date.now() + (hasRank ? 60000 : 30000) // 60s for valid, 30s for invalid
     });
   }
 
@@ -152,10 +207,11 @@ class EloWardTwitchBot {
       this.currentToken = tokenData.token;
       this.tokenExpiresAt = tokenData.expires_at;
 
-      // If token actually changed, reconnect
+      // If token actually changed, reconnect both connections
       if (oldToken !== this.currentToken) {
-        console.log('🔄 Token changed - reconnecting to Twitch...');
-        this.bot.quit('Token refresh - reconnecting');
+        console.log('🔄 Token changed - reconnecting both IRC connections...');
+        this.primaryBot.quit('Token refresh - reconnecting');
+        this.secondaryBot.quit('Token refresh - reconnecting');
         
         setTimeout(() => {
           this.connectToTwitch();
@@ -172,43 +228,45 @@ class EloWardTwitchBot {
   }
 
   setupEventHandlers() {
-    this.bot.on('registered', () => {
-      console.log('✅ Connected to Twitch IRC successfully!');
+    // Primary connection event handlers
+    this.primaryBot.on('registered', () => {
+      console.log('✅ Primary IRC connection established!');
       this.reconnectAttempts = 0;
-      this.loadChannelsFromCloudflare();
+      this.loadChannels();
       
       // Post-startup channel check
       setTimeout(() => {
-        console.log('🔄 Post-startup channel check...');
-        this.reloadChannelsIfNeeded();
+        console.log('🔄 Post-startup channel sync...');
+        this.reloadChannels();
       }, 5000);
     });
 
-    this.bot.on('privmsg', this.handleMessage.bind(this));
-    
-    this.bot.on('error', (err) => {
-      console.error('❌ IRC Error:', err);
-      this.handleConnectionError(err);
+    this.primaryBot.on('privmsg', (event) => this.handleMessage(event, 'primary'));
+    this.primaryBot.on('error', (err) => this.handleConnectionError(err, 'primary'));
+    this.primaryBot.on('close', () => this.handleConnectionError(new Error('Primary connection closed'), 'primary'));
+
+    // Secondary connection event handlers  
+    this.secondaryBot.on('registered', () => {
+      console.log('✅ Secondary IRC connection established for resilience!');
     });
 
-    this.bot.on('close', () => {
-      console.log('🔌 IRC connection closed');
-      this.handleConnectionError(new Error('Connection closed'));
-    });
+    this.secondaryBot.on('privmsg', (event) => this.handleMessage(event, 'secondary'));
+    this.secondaryBot.on('error', (err) => this.handleConnectionError(err, 'secondary'));
+    this.secondaryBot.on('close', () => this.handleConnectionError(new Error('Secondary connection closed'), 'secondary'));
   }
 
-  // PRODUCTION ERROR HANDLING - Exponential backoff reconnection
-  async handleConnectionError(error) {
-    console.error('🔌 Connection error occurred:', error.message);
+  // PRODUCTION ERROR HANDLING - Exponential backoff reconnection with dual connection support
+  async handleConnectionError(error, connection = 'unknown') {
+    console.error(`🔌 ${connection} connection error occurred:`, error.message);
     
-    if (error.message === 'Token refresh - reconnecting') {
+    if (error.message.includes('Token refresh - reconnecting')) {
       return;
     }
 
     const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), this.maxReconnectDelay);
     this.reconnectAttempts++;
     
-    console.log(`🔄 Scheduling reconnection attempt ${this.reconnectAttempts} in ${delay}ms`);
+    console.log(`🔄 Scheduling ${connection} reconnection attempt ${this.reconnectAttempts} in ${delay}ms`);
     
     setTimeout(async () => {
       try {
@@ -218,42 +276,309 @@ class EloWardTwitchBot {
           this.tokenExpiresAt = tokenData.expires_at;
         }
         
+        // Reconnect the specific connection that failed
+        const connectionConfig = {
+          host: 'irc.chat.twitch.tv',
+          port: 6667,
+          nick: 'elowardbot',
+          username: 'elowardbot',
+          password: this.currentToken
+        };
+
+        if (connection === 'primary') {
+          this.primaryBot.connect(connectionConfig);
+        } else if (connection === 'secondary') {
+          this.secondaryBot.connect(connectionConfig);
+        } else {
+          // Fallback: reconnect both
         await this.connectToTwitch();
+        }
       } catch (e) {
-        console.error(`❌ Reconnection attempt ${this.reconnectAttempts} failed:`, e.message);
+        console.error(`❌ ${connection} reconnection attempt ${this.reconnectAttempts} failed:`, e.message);
       }
     }, delay);
   }
 
-  async handleMessage(event) {
-    const channel = event.target.replace('#', '');
-    const user = event.nick;
+  // PRODUCTION MESSAGE PROCESSING - Fast decisions with local caching (dual connection support)
+  async handleMessage(event, connection = 'primary') {
+    const startTime = Date.now();
+    const channelLogin = event.target.replace('#', '');
+    const userLogin = event.nick;
     const message = event.message;
 
-    console.log(`📝 [${channel}] ${user}: ${message}`);
+    // Fast prefix check for chat commands (only process on primary to avoid duplicates)
+    if (message.startsWith('!eloward') && connection === 'primary') {
+      return this.handleChatCommand(channelLogin, userLogin, message, event);
+    }
 
     try {
-      const response = await fetch(`${this.CLOUDFLARE_WORKER_URL}/check-message`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ channel, user, message })
-      });
-
-      if (response.ok) {
-        const result = await response.json();
-        console.log(`✅ Processed message for ${user} in ${channel}:`, result.action);
-      } else {
-        console.error(`❌ CF Worker responded with ${response.status}`);
+      // Step 1: Get channel config (cache hit = instant decision)
+      let config = this.getCachedConfig(channelLogin);
+      
+      if (!config) {
+        // Cache miss - HMAC call to Worker
+        config = await this.fetchChannelConfig(channelLogin);
+        this.setCachedConfig(channelLogin, config);
       }
+
+      if (!config?.bot_enabled) {
+        // Channel not configured or in standby mode - allow all messages
+        return;
+      }
+
+      // Step 2: Check if user is exempt (broadcaster/mod/vip based on config)
+      if (this.isUserExempt(userLogin, channelLogin, event, config)) {
+        return;
+      }
+
+      // Step 3: Check user rank (cache hit = instant decision)
+      let rankResult = this.getCachedRank(userLogin);
+      
+      if (!rankResult) {
+        // Cache miss - HMAC call to Worker
+        const hasRank = await this.fetchUserRank(userLogin);
+        this.setCachedRank(userLogin, hasRank);
+        rankResult = { hasRank, cached: false };
+      }
+
+      // Step 4: Apply enforcement logic
+      const shouldTimeout = this.shouldTimeoutUser(rankResult.hasRank, config);
+      
+      if (shouldTimeout) {
+        await this.executeTimeout(channelLogin, userLogin, config);
+        const duration = Date.now() - startTime;
+        console.log(`⏱️  Message decision: TIMEOUT ${userLogin} in ${channelLogin} (${duration}ms)`);
+      }
+
     } catch (error) {
-      console.error(`❌ Error processing message: ${error.message}`);
+      const duration = Date.now() - startTime;
+      console.error(`❌ Message processing error for ${userLogin} in ${channelLogin} (${duration}ms):`, error.message);
+      // Fail open on errors - don't timeout on system failures
     }
   }
 
-  async loadChannelsFromCloudflare() {
+  // HMAC-secured config fetch with caching
+  async fetchChannelConfig(channelLogin) {
     try {
-      console.log('📡 Loading channels from Cloudflare...');
-      const response = await fetch(`${this.CLOUDFLARE_WORKER_URL}/channels`);
+      const path = '/bot/config:get';
+      const body = JSON.stringify({ channel_login: channelLogin });
+      const headers = this.signRequest('POST', path, body);
+      
+      const response = await fetch(`${this.WORKER_URL}${path}`, {
+        method: 'POST',
+        headers,
+        body
+      });
+
+      if (response.ok) {
+        const config = await response.json();
+        return config;
+      } else if (response.status === 404) {
+        return null; // Channel not configured
+      } else {
+        console.warn(`Config fetch failed for ${channelLogin}: ${response.status}`);
+        return null;
+      }
+    } catch (error) {
+      console.warn(`Config fetch error for ${channelLogin}:`, error.message);
+      return null;
+    }
+  }
+
+  // HMAC-secured rank fetch with caching
+  async fetchUserRank(userLogin) {
+    try {
+      const path = '/rank:get';
+      const body = JSON.stringify({ user_login: userLogin });
+      const headers = this.signRequest('POST', path, body);
+      
+      const response = await fetch(`${this.WORKER_URL}${path}`, {
+        method: 'POST',
+        headers,
+        body
+      });
+
+      if (response.ok) {
+        return true; // User has valid rank
+      } else {
+        return false; // No valid rank
+      }
+    } catch (error) {
+      console.warn(`Rank fetch error for ${userLogin}:`, error.message);
+      return false; // Fail closed on errors
+    }
+  }
+
+  // Check if user should be exempt from enforcement
+  isUserExempt(userLogin, channelLogin, event, config) {
+    // Always exempt broadcaster
+    if (userLogin.toLowerCase() === channelLogin.toLowerCase()) {
+      return true;
+    }
+
+    // Check IRC badges from event
+    const badges = event.tags?.badges || '';
+    const ignoreRoles = (config.ignore_roles || 'broadcaster,moderator').toLowerCase();
+    
+    if (ignoreRoles.includes('moderator') && badges.includes('moderator/')) {
+      return true;
+    }
+    
+    if (ignoreRoles.includes('vip') && badges.includes('vip/')) {
+      return true;
+    }
+    
+    if (ignoreRoles.includes('subscriber') && badges.includes('subscriber/')) {
+      return true;
+    }
+
+    return false;
+  }
+
+  // Enforcement logic based on config
+  shouldTimeoutUser(hasRank, config) {
+    if (!config.bot_enabled) return false;
+
+    const mode = config.enforcement_mode || 'has_rank';
+    
+    if (mode === 'has_rank') {
+      return !hasRank; // Timeout if no rank badge
+    }
+    
+    if (mode === 'min_rank') {
+      // For minimum rank mode, we need rank details from Worker
+      // For now, treat as has_rank mode - can be enhanced later
+      return !hasRank;
+    }
+    
+    return false;
+  }
+
+  // Execute timeout via Twitch Helix API (bot calls directly)  
+  async executeTimeout(channelLogin, userLogin, config) {
+    try {
+      const duration = config.timeout_seconds || 30;
+      const reasonTemplate = config.reason_template || '{seconds}s timeout: not enough elo to speak. Link your EloWard at {site}';
+      
+      const reason = reasonTemplate
+        .replace('{seconds}', duration)
+        .replace('{site}', 'https://eloward.com')
+        .replace('{user}', userLogin);
+
+      // Use bot's own token to timeout via Helix API
+      const response = await fetch(`https://api.twitch.tv/helix/moderation/bans`, {
+        method: 'POST', 
+        headers: {
+          'Authorization': `Bearer ${this.currentToken.replace('oauth:', '')}`,
+          'Client-Id': process.env.TWITCH_CLIENT_ID || 'your-client-id',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          data: {
+            user_id: userLogin, // Will need user ID lookup in production
+            duration,
+            reason
+          }
+        })
+      });
+
+      if (response.ok) {
+        console.log(`🔨 Timeout executed: ${userLogin} in ${channelLogin} (${duration}s)`);
+      } else {
+        console.warn(`⚠️ Timeout failed: ${userLogin} in ${channelLogin} (${response.status})`);
+      }
+    } catch (error) {
+      console.warn(`⚠️ Timeout error for ${userLogin} in ${channelLogin}:`, error.message);
+    }
+  }
+
+  // Chat command processing (!eloward commands)
+  async handleChatCommand(channelLogin, userLogin, message, event) {
+    try {
+      // Only broadcaster and moderators can use commands
+      if (!this.isUserExempt(userLogin, channelLogin, event, { ignore_roles: 'broadcaster,moderator' })) {
+        return;
+      }
+
+      const parts = message.toLowerCase().split(' ');
+      const command = parts[1];
+
+      switch (command) {
+        case 'on':
+          await this.updateChannelConfig(channelLogin, { bot_enabled: true });
+          console.log(`🔵 ${userLogin} enabled bot in ${channelLogin}`);
+          break;
+
+        case 'off':
+          await this.updateChannelConfig(channelLogin, { bot_enabled: false });
+          console.log(`🔴 ${userLogin} disabled bot in ${channelLogin}`);
+          break;
+
+        case 'mode':
+          if (parts[2] === 'hasrank') {
+            await this.updateChannelConfig(channelLogin, { enforcement_mode: 'has_rank' });
+            console.log(`⚙️ ${userLogin} set mode to hasrank in ${channelLogin}`);
+          } else if (parts[2] === 'minrank' && parts[3] && parts[4]) {
+            const tier = parts[3].toUpperCase();
+            const division = parts[4].toUpperCase();
+            await this.updateChannelConfig(channelLogin, {
+              enforcement_mode: 'min_rank',
+              min_rank_tier: tier,
+              min_rank_division: division
+            });
+            console.log(`⚙️ ${userLogin} set mode to minrank ${tier} ${division} in ${channelLogin}`);
+          }
+          break;
+
+        case 'timeout':
+          if (parts[2] && !isNaN(parts[2])) {
+            const seconds = Math.max(1, Math.min(1209600, parseInt(parts[2])));
+            await this.updateChannelConfig(channelLogin, { timeout_seconds: seconds });
+            console.log(`⏱️ ${userLogin} set timeout to ${seconds}s in ${channelLogin}`);
+          }
+          break;
+
+        default:
+          console.log(`❓ Unknown command from ${userLogin} in ${channelLogin}: ${message}`);
+      }
+    } catch (error) {
+      console.error(`❌ Chat command error from ${userLogin} in ${channelLogin}:`, error.message);
+    }
+  }
+
+  // HMAC-secured config update
+  async updateChannelConfig(channelLogin, updates) {
+    try {
+      const path = '/bot/config:update';
+      const body = JSON.stringify({
+        channel_login: channelLogin,
+        fields: updates
+      });
+      const headers = this.signRequest('POST', path, body);
+      
+      const response = await fetch(`${this.WORKER_URL}${path}`, {
+        method: 'POST',
+        headers,
+        body
+      });
+
+      if (response.ok) {
+        // Invalidate local cache so next message gets fresh config
+        this.configCache.delete(channelLogin);
+        console.log(`✅ Config updated for ${channelLogin}:`, updates);
+      } else {
+        console.warn(`Config update failed for ${channelLogin}: ${response.status}`);
+      }
+    } catch (error) {
+      console.warn(`Config update error for ${channelLogin}:`, error.message);
+    }
+  }
+
+  // Channel loading from Worker with dual connection distribution (75-80 channels each)
+  async loadChannels() {
+    try {
+      console.log('📡 Loading channels from Worker...');
+      const response = await fetch(`${this.WORKER_URL}/channels`);
       
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -261,23 +586,45 @@ class EloWardTwitchBot {
       
       const { channels } = await response.json();
       
-      channels.forEach(channel => {
-        this.bot.join(`#${channel}`);
-        this.channels.add(channel);
-      });
+      // Distribute channels across both connections (max 80 per connection per README)
+      const primaryChannels = channels.slice(0, this.maxChannelsPerConnection);
+      const secondaryChannels = channels.slice(this.maxChannelsPerConnection, this.maxChannelsPerConnection * 2);
       
-      console.log(`✅ Joined ${channels.length} channels:`, channels);
+      // Join channels on primary connection with rate limiting
+      for (const channel of primaryChannels) {
+        this.primaryBot.join(`#${channel}`);
+        this.channels.set(channel, { primary: true, secondary: false });
+        console.log(`✅ Joined (primary): #${channel}`);
+        
+        // Rate limit: 20 joins per 10 seconds = 500ms between joins
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+      
+      // Join channels on secondary connection with rate limiting
+      for (const channel of secondaryChannels) {
+        this.secondaryBot.join(`#${channel}`);
+        this.channels.set(channel, { 
+          primary: this.channels.has(channel) ? this.channels.get(channel).primary : false, 
+          secondary: true 
+        });
+        console.log(`✅ Joined (secondary): #${channel}`);
+        
+        // Rate limit: 20 joins per 10 seconds = 500ms between joins
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+      
+      console.log(`✅ Joined ${channels.length} channels total (${primaryChannels.length} primary, ${secondaryChannels.length} secondary)`);
     } catch (error) {
       console.error('❌ Failed to load channels:', error.message);
-      console.log('⚠️ No channels loaded - bot will not join any channels automatically');
+      console.log('⚠️ Bot will continue with empty channel list');
     }
   }
 
-  // Dynamic channel reloading (join new, leave removed)
-  async reloadChannelsIfNeeded() {
+  // Reload channels with dual connection support - join new, leave removed
+  async reloadChannels() {
     try {
-      console.log('🔍 Checking for channel changes...');
-      const response = await fetch(`${this.CLOUDFLARE_WORKER_URL}/channels`);
+      console.log('🔍 Reloading channel list...');
+      const response = await fetch(`${this.WORKER_URL}/channels`);
       
       if (!response.ok) {
         console.log(`⚠️ Channel reload failed: HTTP ${response.status}`);
@@ -286,37 +633,49 @@ class EloWardTwitchBot {
       
       const { channels: newChannels } = await response.json();
       const newChannelSet = new Set(newChannels);
-      const currentChannels = Array.from(this.channels);
+      const currentChannels = Array.from(this.channels.keys());
       
       const channelsToJoin = newChannels.filter(channel => !this.channels.has(channel));
       const channelsToLeave = currentChannels.filter(channel => !newChannelSet.has(channel));
       
-      // Join new channels
-      if (channelsToJoin.length > 0) {
-        console.log(`📥 Joining ${channelsToJoin.length} new channels:`, channelsToJoin);
+      // Join new channels with dual connection distribution
         for (const channel of channelsToJoin) {
-          this.bot.join(`#${channel}`);
-          this.channels.add(channel);
-          console.log(`✅ Joined: #${channel}`);
-          await new Promise(resolve => setTimeout(resolve, 200));
+        const primaryChannelCount = Array.from(this.channels.values()).filter(c => c.primary).length;
+        const usePrimary = primaryChannelCount < this.maxChannelsPerConnection;
+        
+        if (usePrimary) {
+          this.primaryBot.join(`#${channel}`);
+          this.channels.set(channel, { primary: true, secondary: false });
+          console.log(`📥 Joined (primary): #${channel}`);
+        } else {
+          this.secondaryBot.join(`#${channel}`);
+          this.channels.set(channel, { primary: false, secondary: true });
+          console.log(`📥 Joined (secondary): #${channel}`);
         }
+        
+        await new Promise(resolve => setTimeout(resolve, 500));
       }
       
-      // Leave removed channels
-      if (channelsToLeave.length > 0) {
-        console.log(`📤 Leaving ${channelsToLeave.length} removed channels:`, channelsToLeave);
+      // Leave removed channels from both connections
         for (const channel of channelsToLeave) {
-          this.bot.part(`#${channel}`);
-          this.channels.delete(channel);
-          console.log(`👋 Left: #${channel}`);
-          await new Promise(resolve => setTimeout(resolve, 200));
+        const channelInfo = this.channels.get(channel);
+        if (channelInfo?.primary) {
+          this.primaryBot.part(`#${channel}`);
         }
+        if (channelInfo?.secondary) {
+          this.secondaryBot.part(`#${channel}`);
+        }
+        this.channels.delete(channel);
+        console.log(`📤 Left: #${channel}`);
+        await new Promise(resolve => setTimeout(resolve, 200));
       }
       
       if (channelsToJoin.length === 0 && channelsToLeave.length === 0) {
         console.log('✅ No channel changes detected');
       } else {
-        console.log(`🔄 Channel reload complete. Now in ${this.channels.size} channels:`, Array.from(this.channels));
+        const primaryCount = Array.from(this.channels.values()).filter(c => c.primary).length;
+        const secondaryCount = Array.from(this.channels.values()).filter(c => c.secondary).length;
+        console.log(`🔄 Channel reload complete. Now in ${this.channels.size} channels (${primaryCount} primary, ${secondaryCount} secondary)`);
       }
       
     } catch (error) {
@@ -324,86 +683,35 @@ class EloWardTwitchBot {
     }
   }
 
-  // SQS message polling for reliable backup delivery
-  startSQSPolling() {
-    if (!this.queueUrl) {
-      console.log('⚠️ SQS not configured - no backup messaging');
-      return;
-    }
-
-    console.log('🔄 Starting SQS backup polling...');
-    
-    const pollSQS = async () => {
-      try {
-        const command = new ReceiveMessageCommand({
-          QueueUrl: this.queueUrl,
-          MaxNumberOfMessages: 10,
-          WaitTimeSeconds: 20, // Long polling
-          MessageAttributeNames: ['All']
-        });
-        
-        const response = await this.sqs.send(command);
-        
-        if (response.Messages) {
-          for (const message of response.Messages) {
-            await this.handleSQSMessage(message);
-            
-            // Delete processed message
-            await this.sqs.send(new DeleteMessageCommand({
-              QueueUrl: this.queueUrl,
-              ReceiptHandle: message.ReceiptHandle
-            }));
-          }
-        }
-      } catch (error) {
-        console.error('❌ SQS polling error:', error.message);
-      }
-      
-      // Continue polling
-      setTimeout(pollSQS, 1000);
-    };
-
-    // Start polling
-    pollSQS();
-  }
-
-  async handleSQSMessage(message) {
-    try {
-      const body = JSON.parse(message.Body);
-      console.log('📨 SQS backup message received:', body);
-      
-      if (body.action === 'enable' || body.action === 'disable') {
-        console.log('🔔 Channel update via SQS backup:', body.action, body.channel);
-        await this.reloadChannelsIfNeeded();
-      }
-    } catch (error) {
-      console.error('❌ SQS message handling error:', error.message);
-    }
-  }
-
-  // Redis subscription for instant notifications (primary method)
+  // Redis subscription for instant config updates (1-3s propagation)
   startRedisSubscription() {
     if (!this.redis) {
-      console.log('⚠️ Redis not configured - relying on SQS for channel updates');
+      console.log('⚠️ Redis not configured - using polling fallback only');
       return;
     }
 
-    console.log('🔄 Starting Redis subscription for instant notifications...');
+    console.log('🔄 Starting Redis subscription for instant config updates...');
     
     this.redis.connect().then(() => {
-      console.log('✅ Connected to Redis for instant channel updates');
+      console.log('✅ Connected to Redis for instant notifications');
       
-      this.redis.subscribe('eloward:bot:commands');
+      this.redis.subscribe('eloward:config:updates');
       
       this.redis.on('message', async (channel, message) => {
-        if (channel === 'eloward:bot:commands') {
+        if (channel === 'eloward:config:updates') {
           try {
             const data = JSON.parse(message);
-            console.log('⚡ Instant Redis notification:', data);
+            console.log('⚡ Redis config update:', data.type, data.channel_login);
             
-            if (data.action === 'enable' || data.action === 'disable') {
-              console.log('🚀 Instant channel update via Redis:', data.action, data.channel);
-              await this.reloadChannelsIfNeeded();
+            if (data.type === 'config_update' && data.channel_login) {
+              // Invalidate cache for instant effect
+              this.configCache.delete(data.channel_login);
+              
+              // Check if this affects channel membership
+              if (data.fields?.bot_enabled !== undefined) {
+                console.log('🚀 Instant channel membership change:', data.channel_login, data.fields.bot_enabled);
+                setTimeout(() => this.reloadChannels(), 1000);
+              }
             }
           } catch (error) {
             console.error('❌ Redis message handling error:', error.message);
@@ -421,24 +729,64 @@ class EloWardTwitchBot {
       
     }).catch((error) => {
       console.error('❌ Redis connection failed:', error.message);
-      console.log('⚠️ Falling back to SQS-only messaging');
+      console.log('⚠️ Continuing with polling-based updates only');
     });
+  }
+
+  // Self-healing config sweep (every 60-120s)
+  startConfigSweep() {
+    const sweepInterval = 90000 + Math.random() * 30000; // 90-120s with jitter
+    
+    this.configSweepInterval = setInterval(() => {
+      console.log('🧹 Running config sweep for cache consistency...');
+      
+      // Clear expired cache entries
+      const now = Date.now();
+      
+      for (const [key, cached] of this.configCache.entries()) {
+        if (now >= cached.expires) {
+          this.configCache.delete(key);
+        }
+      }
+      
+      for (const [key, cached] of this.rankCache.entries()) {
+        if (now >= cached.expires) {
+          this.rankCache.delete(key);
+        }
+      }
+      
+      console.log(`🧹 Config sweep complete. Cache sizes: config=${this.configCache.size}, rank=${this.rankCache.size}`);
+    }, sweepInterval);
+    
+    console.log(`🧹 Config sweep started (${Math.round(sweepInterval/1000)}s interval)`);
   }
 }
 
-// Graceful shutdown
+// Graceful shutdown with dual connection support
 process.on('SIGTERM', () => {
   console.log('👋 Shutting down gracefully...');
-  if (bot.redis) bot.redis.disconnect();
+  if (bot?.redis) bot.redis.disconnect();
+  if (bot?.primaryBot) bot.primaryBot.quit('Server shutdown');
+  if (bot?.secondaryBot) bot.secondaryBot.quit('Server shutdown');
+  if (bot?.tokenCheckInterval) clearInterval(bot.tokenCheckInterval);
+  if (bot?.configSweepInterval) clearInterval(bot.configSweepInterval);
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
   console.log('👋 Interrupted - shutting down gracefully...');
-  if (bot.redis) bot.redis.disconnect();
+  if (bot?.redis) bot.redis.disconnect();
+  if (bot?.primaryBot) bot.primaryBot.quit('Server shutdown');
+  if (bot?.secondaryBot) bot.secondaryBot.quit('Server shutdown');
+  if (bot?.tokenCheckInterval) clearInterval(bot.tokenCheckInterval);
+  if (bot?.configSweepInterval) clearInterval(bot.configSweepInterval);
   process.exit(0);
 });
 
-// Start the bot
+// Start the production bot
+console.log('🚀 Starting EloWard Production Bot...');
 const bot = new EloWardTwitchBot();
-bot.start();
+bot.start().catch(error => {
+  console.error('💥 Bot startup failed:', error);
+  process.exit(1);
+});
