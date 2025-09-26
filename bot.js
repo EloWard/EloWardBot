@@ -308,46 +308,63 @@ class EloWardTwitchBot {
 
     // Fast prefix check for chat commands (only process on primary to avoid duplicates)
     if (message.startsWith('!eloward') && connection === 'primary') {
+      console.log(`🎯 Chat command detected: ${userLogin} in ${channelLogin}: ${message}`);
       return this.handleChatCommand(channelLogin, userLogin, message, event);
     }
 
     try {
       // Step 1: Get channel config (cache hit = instant decision)
       let config = this.getCachedConfig(channelLogin);
+      const configCached = !!config;
       
       if (!config) {
         // Cache miss - HMAC call to Worker
+        console.log(`🔍 Config cache miss for ${channelLogin}, fetching from Worker...`);
         config = await this.fetchChannelConfig(channelLogin);
         this.setCachedConfig(channelLogin, config);
       }
 
       if (!config?.bot_enabled) {
         // Channel not configured or in standby mode - allow all messages
+        console.log(`⏸️  Bot in standby for ${channelLogin} (enabled: ${config?.bot_enabled}), allowing message from ${userLogin}`);
         return;
       }
 
+      console.log(`🤖 Bot active in ${channelLogin}, processing message from ${userLogin} (config cached: ${configCached})`);
+
       // Step 2: Check if user is exempt (broadcaster/mod/vip based on config)
       if (this.isUserExempt(userLogin, channelLogin, event, config)) {
+        console.log(`👑 User ${userLogin} is exempt in ${channelLogin}, allowing message`);
         return;
       }
 
       // Step 3: Check user rank (cache hit = instant decision)
       let rankResult = this.getCachedRank(userLogin);
+      const rankCached = !!rankResult;
       
       if (!rankResult) {
         // Cache miss - HMAC call to Worker
+        console.log(`🔍 Rank cache miss for ${userLogin}, fetching from Worker...`);
         const hasRank = await this.fetchUserRank(userLogin);
         this.setCachedRank(userLogin, hasRank);
         rankResult = { hasRank, cached: false };
       }
 
+      console.log(`📊 Rank check for ${userLogin}: hasRank=${rankResult.hasRank} (cached: ${rankCached})`);
+
       // Step 4: Apply enforcement logic
       const shouldTimeout = this.shouldTimeoutUser(rankResult.hasRank, config);
       
+      console.log(`⚖️  Enforcement decision for ${userLogin} in ${channelLogin}: shouldTimeout=${shouldTimeout} (mode: ${config.enforcement_mode})`);
+      
       if (shouldTimeout) {
+        console.log(`🔨 Executing timeout for ${userLogin} in ${channelLogin}...`);
         await this.executeTimeout(channelLogin, userLogin, config);
         const duration = Date.now() - startTime;
         console.log(`⏱️  Message decision: TIMEOUT ${userLogin} in ${channelLogin} (${duration}ms)`);
+      } else {
+        const duration = Date.now() - startTime;
+        console.log(`✅ Message allowed: ${userLogin} in ${channelLogin} (${duration}ms)`);
       }
 
     } catch (error) {
@@ -465,8 +482,21 @@ class EloWardTwitchBot {
         .replace('{site}', 'https://eloward.com')
         .replace('{user}', userLogin);
 
-      // Use bot's own token to timeout via Helix API
-      const response = await fetch(`https://api.twitch.tv/helix/moderation/bans`, {
+      // First, get user ID, broadcaster ID, and bot's own ID from Twitch API
+      const userInfo = await this.getTwitchUserInfo([userLogin, channelLogin, 'elowardbot']);
+      if (!userInfo || !userInfo[userLogin] || !userInfo[channelLogin] || !userInfo['elowardbot']) {
+        console.error(`❌ Failed to get user IDs for timeout: ${userLogin} in ${channelLogin}`);
+        return;
+      }
+
+      const userId = userInfo[userLogin].id;
+      const broadcasterId = userInfo[channelLogin].id;
+      const botUserId = userInfo['elowardbot'].id;
+
+      console.log(`🔍 Timeout attempt: ${userLogin}(${userId}) in ${channelLogin}(${broadcasterId}) for ${duration}s (bot: ${botUserId})`);
+
+      // Use bot's own token to timeout via Helix API with correct parameters
+      const response = await fetch(`https://api.twitch.tv/helix/moderation/bans?broadcaster_id=${broadcasterId}&moderator_id=${botUserId}`, {
         method: 'POST', 
         headers: {
           'Authorization': `Bearer ${this.currentToken.replace('oauth:', '')}`,
@@ -475,9 +505,9 @@ class EloWardTwitchBot {
         },
         body: JSON.stringify({
           data: {
-            user_id: userLogin, // Will need user ID lookup in production
-            duration,
-            reason
+            user_id: userId,
+            duration: duration,
+            reason: reason
           }
         })
       });
@@ -485,10 +515,40 @@ class EloWardTwitchBot {
       if (response.ok) {
         console.log(`🔨 Timeout executed: ${userLogin} in ${channelLogin} (${duration}s)`);
       } else {
-        console.warn(`⚠️ Timeout failed: ${userLogin} in ${channelLogin} (${response.status})`);
+        const errorData = await response.text();
+        console.warn(`⚠️ Timeout failed: ${userLogin} in ${channelLogin} (${response.status}): ${errorData}`);
       }
     } catch (error) {
       console.warn(`⚠️ Timeout error for ${userLogin} in ${channelLogin}:`, error.message);
+    }
+  }
+
+  // Get Twitch user info for multiple users
+  async getTwitchUserInfo(userLogins) {
+    try {
+      const loginParams = userLogins.map(login => `login=${encodeURIComponent(login)}`).join('&');
+      const response = await fetch(`https://api.twitch.tv/helix/users?${loginParams}`, {
+        headers: {
+          'Authorization': `Bearer ${this.currentToken.replace('oauth:', '')}`,
+          'Client-Id': process.env.TWITCH_CLIENT_ID || 'your-client-id'
+        }
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      const data = await response.json();
+      const userMap = {};
+      
+      for (const user of data.data || []) {
+        userMap[user.login.toLowerCase()] = user;
+      }
+
+      return userMap;
+    } catch (error) {
+      console.error('❌ Failed to get Twitch user info:', error.message);
+      return null;
     }
   }
 
