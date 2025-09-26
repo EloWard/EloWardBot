@@ -458,7 +458,7 @@ class EloWardTwitchBot {
   async executeTimeout(channelLogin, userLogin, config) {
     try {
       const duration = config.timeout_seconds || 30;
-      const reasonTemplate = config.reason_template || '{seconds}s timeout: not enough elo to speak. Link your EloWard at {site}';
+      const reasonTemplate = config.reason_template || 'not enough elo to speak. type !eloward';
       
       const reason = reasonTemplate
         .replace('{seconds}', duration)
