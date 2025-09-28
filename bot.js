@@ -495,8 +495,7 @@ class EloWardTwitchBot {
 
       console.log(`🔍 Timeout attempt: ${userLogin}(${userId}) in ${channelLogin}(${broadcasterId}) for ${duration}s (bot: ${botUserId})`);
 
-      // Use bot's own token to timeout via Helix API 
-      // Note: Reason field removed to prevent chat spam - user sees timeout in their own popup
+      // Use bot's own token to timeout via Helix API with correct parameters
       const response = await fetch(`https://api.twitch.tv/helix/moderation/bans?broadcaster_id=${broadcasterId}&moderator_id=${botUserId}`, {
         method: 'POST', 
         headers: {
@@ -507,9 +506,8 @@ class EloWardTwitchBot {
         body: JSON.stringify({
           data: {
             user_id: userId,
-            duration: duration
-            // reason: intentionally omitted to prevent "elowardbot timed out user. Reason: ..." spam in chat
-            // User still sees timeout notification in their own interface
+            duration: duration,
+            reason: reason
           }
         })
       });
