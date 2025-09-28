@@ -495,7 +495,8 @@ class EloWardTwitchBot {
 
       console.log(`🔍 Timeout attempt: ${userLogin}(${userId}) in ${channelLogin}(${broadcasterId}) for ${duration}s (bot: ${botUserId})`);
 
-      // Use bot's own token to timeout via Helix API with correct parameters
+      // Use bot's own token to timeout via Helix API 
+      // Note: Reason field removed to prevent chat spam - user sees timeout in their own popup
       const response = await fetch(`https://api.twitch.tv/helix/moderation/bans?broadcaster_id=${broadcasterId}&moderator_id=${botUserId}`, {
         method: 'POST', 
         headers: {
@@ -506,8 +507,9 @@ class EloWardTwitchBot {
         body: JSON.stringify({
           data: {
             user_id: userId,
-            duration: duration,
-            reason: reason
+            duration: duration
+            // reason: intentionally omitted to prevent "elowardbot timed out user. Reason: ..." spam in chat
+            // User still sees timeout notification in their own interface
           }
         })
       });
@@ -637,7 +639,7 @@ class EloWardTwitchBot {
   // Channel loading from Worker with dual connection distribution (75-80 channels each)
   async loadChannels() {
     try {
-      console.log('📡 Loading channels from Worker...');
+      console.log('📡 Loading channels from Worker (always-on presence model)...');
       const response = await fetch(`${this.WORKER_URL}/channels`);
       
       if (!response.ok) {
@@ -645,35 +647,56 @@ class EloWardTwitchBot {
       }
       
       const { channels } = await response.json();
+      console.log(`📋 Found ${channels.length} total channels to join`);
       
       // Distribute channels across both connections (max 80 per connection per README)
       const primaryChannels = channels.slice(0, this.maxChannelsPerConnection);
       const secondaryChannels = channels.slice(this.maxChannelsPerConnection, this.maxChannelsPerConnection * 2);
       
-      // Join channels on primary connection with rate limiting
-      for (const channel of primaryChannels) {
+      console.log(`🎯 Joining ${primaryChannels.length} channels on primary connection with anti-spam throttling...`);
+      
+      // Join channels on primary connection with conservative rate limiting
+      for (let i = 0; i < primaryChannels.length; i++) {
+        const channel = primaryChannels[i];
         this.primaryBot.join(`#${channel}`);
         this.channels.set(channel, { primary: true, secondary: false });
-        console.log(`✅ Joined (primary): #${channel}`);
+        console.log(`📥 Joined (primary): #${channel} (${i + 1}/${primaryChannels.length})`);
         
-        // Rate limit: 20 joins per 10 seconds = 500ms between joins
-        await new Promise(resolve => setTimeout(resolve, 500));
+        // Conservative rate limit: 15 joins per 10 seconds = 667ms between joins
+        // This prevents Twitch spam detection while maintaining reasonable startup time
+        await new Promise(resolve => setTimeout(resolve, 667));
+        
+        // Progress logging every 10 channels
+        if ((i + 1) % 10 === 0) {
+          console.log(`📊 Primary connection progress: ${i + 1}/${primaryChannels.length} channels joined`);
+        }
       }
       
-      // Join channels on secondary connection with rate limiting
-      for (const channel of secondaryChannels) {
-        this.secondaryBot.join(`#${channel}`);
-        this.channels.set(channel, { 
-          primary: this.channels.has(channel) ? this.channels.get(channel).primary : false, 
-          secondary: true 
-        });
-        console.log(`✅ Joined (secondary): #${channel}`);
+      if (secondaryChannels.length > 0) {
+        console.log(`🎯 Joining ${secondaryChannels.length} channels on secondary connection...`);
         
-        // Rate limit: 20 joins per 10 seconds = 500ms between joins
-        await new Promise(resolve => setTimeout(resolve, 500));
+        // Join channels on secondary connection with rate limiting
+        for (let i = 0; i < secondaryChannels.length; i++) {
+          const channel = secondaryChannels[i];
+          this.secondaryBot.join(`#${channel}`);
+          this.channels.set(channel, { 
+            primary: this.channels.has(channel) ? this.channels.get(channel).primary : false, 
+            secondary: true 
+          });
+          console.log(`📥 Joined (secondary): #${channel} (${i + 1}/${secondaryChannels.length})`);
+          
+          // Conservative rate limit: 15 joins per 10 seconds = 667ms between joins
+          await new Promise(resolve => setTimeout(resolve, 667));
+          
+          // Progress logging every 10 channels
+          if ((i + 1) % 10 === 0) {
+            console.log(`📊 Secondary connection progress: ${i + 1}/${secondaryChannels.length} channels joined`);
+          }
+        }
       }
       
       console.log(`✅ Joined ${channels.length} channels total (${primaryChannels.length} primary, ${secondaryChannels.length} secondary)`);
+      console.log(`⏰ Channel joining completed in ~${Math.ceil(channels.length * 667 / 1000)} seconds with anti-spam throttling`);
     } catch (error) {
       console.error('❌ Failed to load channels:', error.message);
       console.log('⚠️ Bot will continue with empty channel list');

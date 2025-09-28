@@ -185,9 +185,11 @@ Dashboard/Chat → Worker (/bot/config:update) → D1 Write → Redis Publish �
 
 ### **Twitch Limits & Connection Strategy**
 
-**JOIN Rate Limits**:
-- Max 20 channels per 10 seconds per connection
-- Bot throttles joins on startup to stay well under limits
+**JOIN Rate Limits & Anti-Spam**:
+- Max 15 channels per 10 seconds per connection (conservative approach)
+- 667ms delay between JOINs to prevent Twitch spam detection
+- Progressive startup with detailed logging to track join progress
+- Always-on presence model: joins ALL channels regardless of enabled status
 
 **Connection Strategy**:
 - Two IRC connections (75-80 channels each) for resilience
