@@ -141,20 +141,14 @@ class EloWardTwitchBot {
     }, 2000);
   }
 
-  // Local caching with TTL for performance
+  // Permanent local caching - only invalidated by Redis pub/sub
   getCachedConfig(channelLogin) {
     const cached = this.configCache.get(channelLogin);
-    if (cached && Date.now() < cached.expires) {
-      return cached.config;
-    }
-    return null;
+    return cached ? cached.config : null;
   }
 
   setCachedConfig(channelLogin, config) {
-    this.configCache.set(channelLogin, {
-      config,
-      expires: Date.now() + (config ? 2000 : 1000) // 2s for valid, 1s for null
-    });
+    this.configCache.set(channelLogin, { config });
   }
 
   getCachedRank(userLogin) {
@@ -324,6 +318,9 @@ class EloWardTwitchBot {
         this.setCachedConfig(channelLogin, config);
       }
 
+      // Debug: Always log the config state for troubleshooting
+      console.log(`🔍 Config check for ${channelLogin}: enabled=${config?.bot_enabled}, cached=${configCached}, config=${config ? 'present' : 'null'}`);
+
       if (!config?.bot_enabled) {
         // Channel not configured or in standby mode - allow all messages
         console.log(`⏸️  Bot in standby for ${channelLogin} (enabled: ${config?.bot_enabled}), allowing message from ${userLogin}`);
@@ -389,8 +386,10 @@ class EloWardTwitchBot {
 
       if (response.ok) {
         const config = await response.json();
+        console.log(`📥 Config fetched for ${channelLogin}: enabled=${config.bot_enabled}, enforcement=${config.enforcement_mode}`);
         return config;
       } else if (response.status === 404) {
+        console.log(`📭 No config found for ${channelLogin} (404)`);
         return null; // Channel not configured
       } else {
         console.warn(`Config fetch failed for ${channelLogin}: ${response.status}`);
@@ -421,8 +420,8 @@ class EloWardTwitchBot {
         return false; // No valid rank
       }
     } catch (error) {
-      console.warn(`Rank fetch error for ${userLogin}:`, error.message);
-      return false; // Fail closed on errors
+      console.warn(`Rank fetch error for ${userLogin} - failing open (allowing message):`, error.message);
+      return true; // Fail open on errors - assume user has rank to avoid timeouts due to system issues
     }
   }
 
@@ -452,23 +451,24 @@ class EloWardTwitchBot {
     return false;
   }
 
-  // Enforcement logic based on config
+  // Enforcement logic based on config - FAIL-OPEN design
+  // Note: hasRank=true on system errors (fetchUserRank catch block) to avoid timeouts during outages
   shouldTimeoutUser(hasRank, config) {
     if (!config.bot_enabled) return false;
 
     const mode = config.enforcement_mode || 'has_rank';
     
     if (mode === 'has_rank') {
-      return !hasRank; // Timeout if no rank badge
+      return !hasRank; // Timeout if no rank badge (but hasRank=true on system errors)
     }
     
     if (mode === 'min_rank') {
       // For minimum rank mode, we need rank details from Worker
       // For now, treat as has_rank mode - can be enhanced later
-      return !hasRank;
+      return !hasRank; // (but hasRank=true on system errors)
     }
     
-    return false;
+    return false; // Default: allow message
   }
 
   // Execute timeout via Twitch Helix API (bot calls directly)  
@@ -765,7 +765,9 @@ class EloWardTwitchBot {
             
             if (data.type === 'config_update' && data.channel_login) {
               // Invalidate cache for instant effect
+              const hadCache = this.configCache.has(data.channel_login);
               this.configCache.delete(data.channel_login);
+              console.log(`🗑️  Cache invalidated for ${data.channel_login} (had cache: ${hadCache}, fields: ${JSON.stringify(data.fields)})`);
               
               // Check if this affects channel membership
               if (data.fields?.bot_enabled !== undefined) {
@@ -800,14 +802,8 @@ class EloWardTwitchBot {
     this.configSweepInterval = setInterval(() => {
       console.log('🧹 Running config sweep for cache consistency...');
       
-      // Clear expired cache entries
+      // Clear expired rank cache entries (config cache is permanent - Redis managed)
       const now = Date.now();
-      
-      for (const [key, cached] of this.configCache.entries()) {
-        if (now >= cached.expires) {
-          this.configCache.delete(key);
-        }
-      }
       
       for (const [key, cached] of this.rankCache.entries()) {
         if (now >= cached.expires) {
@@ -815,7 +811,7 @@ class EloWardTwitchBot {
         }
       }
       
-      console.log(`🧹 Config sweep complete. Cache sizes: config=${this.configCache.size}, rank=${this.rankCache.size}`);
+      console.log(`🧹 Config sweep complete. Cache sizes: config=${this.configCache.size} (permanent), rank=${this.rankCache.size}`);
     }, sweepInterval);
     
     console.log(`🧹 Config sweep started (${Math.round(sweepInterval/1000)}s interval)`);
