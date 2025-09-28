@@ -170,17 +170,22 @@ else
   exit 0
 fi
 
-echo "⏱️ Deployment initiated! Checking initial status..."
-sleep 5
+echo "⏱️ Deployment initiated! Checking status..."
 
+# Robust status check with timeout (no table format to prevent hanging)
 echo ""
-echo "📊 Current Service Status:"
-aws ecs describe-services \
+echo "📊 Deployment Status:"
+if timeout 15 aws ecs describe-services \
   --cluster $CLUSTER_NAME \
   --services $SERVICE_NAME \
   --region $AWS_REGION \
-  --query 'services[0].{Desired:desiredCount,Running:runningCount,Status:status,LatestDeployment:deployments[0].rolloutState}' \
-  --output table
+  --query 'services[0].deployments[0].{TaskDef:taskDefinition,State:rolloutState,Running:runningCount,Desired:desiredCount}' \
+  --output text 2>/dev/null; then
+  echo "✅ Status retrieved successfully"
+else
+  echo "⚠️  Status check timed out - deployment continuing in background"
+  echo "💡 This is normal - ECS deployments take 1-3 minutes to complete"
+fi
 
 echo ""
 echo "✅ Deployment Successfully Initiated!"
@@ -191,3 +196,4 @@ echo "📊 Check status: aws ecs describe-services --cluster $CLUSTER_NAME --ser
 echo "📊 ECS Console: https://${AWS_REGION}.console.aws.amazon.com/ecs/home?region=${AWS_REGION}#/clusters/${CLUSTER_NAME}/services"
 echo ""
 echo "⏳ Deployment typically takes 1-3 minutes to complete."
+echo "🤖 Bot will automatically rejoin all channels once the new task starts."
