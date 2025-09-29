@@ -374,7 +374,7 @@ class EloWardTwitchBot {
   // HMAC-secured config fetch with caching
   async fetchChannelConfig(channelLogin) {
     try {
-      const path = '/bot/config:get';
+      const path = '/bot/config-get';
       const body = JSON.stringify({ channel_login: channelLogin });
       const headers = this.signRequest('POST', path, body);
       
@@ -609,7 +609,7 @@ class EloWardTwitchBot {
   // HMAC-secured config update
   async updateChannelConfig(channelLogin, updates) {
     try {
-      const path = '/bot/config:update';
+      const path = '/bot/config-update';
       const body = JSON.stringify({
         channel_login: channelLogin,
         fields: updates
