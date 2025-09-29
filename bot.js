@@ -575,26 +575,36 @@ class EloWardTwitchBot {
           break;
 
         case 'mode':
-          if (parts[2] === 'hasrank') {
+          if (parts[2] === 'has_rank') {
             await this.updateChannelConfig(channelLogin, { enforcement_mode: 'has_rank' });
-            console.log(`⚙️ ${userLogin} set mode to hasrank in ${channelLogin}`);
-          } else if (parts[2] === 'minrank' && parts[3] && parts[4]) {
-            const tier = parts[3].toUpperCase();
-            const division = parts[4].toUpperCase();
+            console.log(`⚙️ ${userLogin} set mode to has_rank in ${channelLogin}`);
+          } else if (parts[2] === 'min_rank') {
             await this.updateChannelConfig(channelLogin, {
               enforcement_mode: 'min_rank',
-              min_rank_tier: tier,
-              min_rank_division: division
             });
-            console.log(`⚙️ ${userLogin} set mode to minrank ${tier} ${division} in ${channelLogin}`);
+            console.log(`⚙️ ${userLogin} set mode to min_rank in ${channelLogin}`);
           }
           break;
 
-        case 'timeout':
-          if (parts[2] && !isNaN(parts[2])) {
-            const seconds = Math.max(1, Math.min(1209600, parseInt(parts[2])));
-            await this.updateChannelConfig(channelLogin, { timeout_seconds: seconds });
-            console.log(`⏱️ ${userLogin} set timeout to ${seconds}s in ${channelLogin}`);
+        case 'set':
+          if (parts[2] === 'timeout') {
+            if (parts[2] && !isNaN(parts[2])) {
+              const seconds = Math.max(1, Math.min(1209600, parseInt(parts[2])));
+              await this.updateChannelConfig(channelLogin, { timeout_seconds: seconds });
+              console.log(`⏱️ ${userLogin} set timeout to ${seconds}s in ${channelLogin}`);
+            }
+          } else if (parts[2] === 'min_rank' && parts[3] && parts[4]) {
+            const tier = parts[3].toUpperCase();
+            const division = parts[4].toUpperCase();
+            await this.updateChannelConfig(channelLogin, {
+              min_rank_tier: tier,
+              min_rank_division: division
+            });
+            console.log(`⚙️ ${userLogin} set minrank ${tier} ${division} in ${channelLogin}`);
+          } else if (parts[2] === 'reason') {
+            const reason = parts[3].replace(/"/g, '');
+            await this.updateChannelConfig(channelLogin, { reason_template: reason });
+            console.log(`⚙️ ${userLogin} set reason to ${reason} in ${channelLogin}`);
           }
           break;
 
