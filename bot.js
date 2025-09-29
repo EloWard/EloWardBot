@@ -552,67 +552,245 @@ class EloWardTwitchBot {
     }
   }
 
+  // Send message to chat channel
+  async sendChatMessage(channelLogin, message) {
+    try {
+      // Send on primary connection to avoid duplicates
+      this.primaryBot.say(`#${channelLogin}`, message);
+      console.log(`💬 Sent to #${channelLogin}: ${message}`);
+    } catch (error) {
+      console.error(`❌ Failed to send message to #${channelLogin}:`, error.message);
+    }
+  }
+
+  // Convert division formats (4 -> IV, IV -> IV, etc)
+  normalizeDivision(division) {
+    const divisionMap = {
+      '1': 'I', '2': 'II', '3': 'III', '4': 'IV', '5': 'V',
+      'I': 'I', 'II': 'II', 'III': 'III', 'IV': 'IV', 'V': 'V'
+    };
+    return divisionMap[division.toUpperCase()] || division.toUpperCase();
+  }
+
+  // Get current config for status display
+  async getCurrentConfig(channelLogin) {
+    let config = this.getCachedConfig(channelLogin);
+    if (!config) {
+      config = await this.fetchChannelConfig(channelLogin);
+      if (config) this.setCachedConfig(channelLogin, config);
+    }
+    return config;
+  }
+
   // Chat command processing (!eloward commands)
   async handleChatCommand(channelLogin, userLogin, message, event) {
     try {
-      // Only broadcaster and moderators can use commands
-      if (!this.isUserExempt(userLogin, channelLogin, event, { ignore_roles: 'broadcaster,moderator' })) {
-        return;
+      const parts = message.split(' ');
+      const command = parts[1]?.toLowerCase();
+      const isPrivileged = this.isUserExempt(userLogin, channelLogin, event, { ignore_roles: 'broadcaster,moderator' });
+      
+      // Handle base !eloward command (anyone can use)
+      if (!command || command === '') {
+        return this.handleStatusCommand(channelLogin, userLogin, isPrivileged);
       }
 
-      const parts = message.toLowerCase().split(' ');
-      const command = parts[1];
+      // Handle help command (anyone can use)
+      if (command === 'help') {
+        return this.handleHelpCommand(channelLogin, userLogin, isPrivileged);
+      }
+
+      // All other commands require mod/broadcaster privileges
+      if (!isPrivileged) {
+        await this.sendChatMessage(channelLogin, `You don't have permission to use that command. Type !eloward help for available commands.`);
+        return;
+      }
 
       switch (command) {
         case 'on':
           await this.updateChannelConfig(channelLogin, { bot_enabled: true });
+          const onConfig = await this.getCurrentConfig(channelLogin);
+          await this.sendChatMessage(channelLogin, `EloWardBot is awake, mode set to ${onConfig?.enforcement_mode || 'has_rank'}. Type !eloward for more info`);
           console.log(`🔵 ${userLogin} enabled bot in ${channelLogin}`);
           break;
 
         case 'off':
           await this.updateChannelConfig(channelLogin, { bot_enabled: false });
+          await this.sendChatMessage(channelLogin, `EloWardBot is now sleeping`);
           console.log(`🔴 ${userLogin} disabled bot in ${channelLogin}`);
           break;
 
         case 'mode':
           if (parts[2] === 'has_rank') {
             await this.updateChannelConfig(channelLogin, { enforcement_mode: 'has_rank' });
+            await this.sendChatMessage(channelLogin, `Mode set to has_rank. Chat restricted to subs and linked EloWard accounts.`);
             console.log(`⚙️ ${userLogin} set mode to has_rank in ${channelLogin}`);
           } else if (parts[2] === 'min_rank') {
-            await this.updateChannelConfig(channelLogin, {
-              enforcement_mode: 'min_rank',
-            });
+            await this.updateChannelConfig(channelLogin, { enforcement_mode: 'min_rank' });
+            const config = await this.getCurrentConfig(channelLogin);
+            const minRankMsg = config?.min_rank_tier && config?.min_rank_division 
+              ? ` (${config.min_rank_tier} ${config.min_rank_division} and above)`
+              : ` (set minimum rank with !eloward set min_rank [tier] [division])`;
+            await this.sendChatMessage(channelLogin, `Mode set to min_rank${minRankMsg}`);
             console.log(`⚙️ ${userLogin} set mode to min_rank in ${channelLogin}`);
+          } else {
+            await this.sendChatMessage(channelLogin, `Invalid mode. Use: !eloward mode has_rank OR !eloward mode min_rank`);
           }
           break;
 
         case 'set':
-          if (parts[2] === 'timeout') {
-            if (parts[2] && !isNaN(parts[2])) {
-              const seconds = Math.max(1, Math.min(1209600, parseInt(parts[2])));
-              await this.updateChannelConfig(channelLogin, { timeout_seconds: seconds });
-              console.log(`⏱️ ${userLogin} set timeout to ${seconds}s in ${channelLogin}`);
-            }
-          } else if (parts[2] === 'min_rank' && parts[3] && parts[4]) {
-            const tier = parts[3].toUpperCase();
-            const division = parts[4].toUpperCase();
-            await this.updateChannelConfig(channelLogin, {
-              min_rank_tier: tier,
-              min_rank_division: division
-            });
-            console.log(`⚙️ ${userLogin} set minrank ${tier} ${division} in ${channelLogin}`);
-          } else if (parts[2] === 'reason') {
-            const reason = parts[3].replace(/"/g, '');
-            await this.updateChannelConfig(channelLogin, { reason_template: reason });
-            console.log(`⚙️ ${userLogin} set reason to ${reason} in ${channelLogin}`);
-          }
+          await this.handleSetCommand(channelLogin, userLogin, parts);
+          break;
+
+        case 'status':
+          await this.handleDetailedStatus(channelLogin, userLogin);
           break;
 
         default:
+          await this.sendChatMessage(channelLogin, `Unknown command "${command}". Type !eloward help for available commands.`);
           console.log(`❓ Unknown command from ${userLogin} in ${channelLogin}: ${message}`);
       }
     } catch (error) {
       console.error(`❌ Chat command error from ${userLogin} in ${channelLogin}:`, error.message);
+      await this.sendChatMessage(channelLogin, `Command failed. Please try again.`);
+    }
+  }
+
+  // Handle !eloward base command - shows current status
+  async handleStatusCommand(channelLogin, userLogin, isPrivileged) {
+    try {
+      const config = await this.getCurrentConfig(channelLogin);
+      
+      if (!config || !config.bot_enabled) {
+        const baseMsg = `EloWardBot is not enforcing right now.`;
+        const fullMsg = isPrivileged ? `${baseMsg} For a list of commands, type !eloward help` : baseMsg;
+        await this.sendChatMessage(channelLogin, fullMsg);
+        return;
+      }
+
+      let statusMsg;
+      if (config.enforcement_mode === 'min_rank' && config.min_rank_tier && config.min_rank_division) {
+        statusMsg = `Chat is restricted to subs, and accounts linked with EloWard that are ${config.min_rank_tier} ${config.min_rank_division} or above. Link your rank at eloward.com`;
+      } else {
+        statusMsg = `Chat is restricted to subs, and accounts linked with EloWard. Link your rank at eloward.com`;
+      }
+      
+      const fullMsg = isPrivileged ? `${statusMsg} | For a list of commands, type !eloward help` : statusMsg;
+      await this.sendChatMessage(channelLogin, fullMsg);
+    } catch (error) {
+      console.error(`❌ Status command error:`, error.message);
+      await this.sendChatMessage(channelLogin, `Unable to check status. Please try again.`);
+    }
+  }
+
+  // Handle !eloward help command
+  async handleHelpCommand(channelLogin, userLogin, isPrivileged) {
+    if (!isPrivileged) {
+      await this.sendChatMessage(channelLogin, `@${userLogin} Available commands: !eloward (check status) | !eloward help (this message)`);
+      return;
+    }
+
+    const helpMsg = `EloWard Commands: !eloward on/off | !eloward mode has_rank/min_rank | !eloward set timeout [seconds] | !eloward set min_rank [tier] [division] | !eloward set reason [text] | !eloward status (detailed info)`;
+    await this.sendChatMessage(channelLogin, helpMsg);
+  }
+
+  // Handle detailed status for mods
+  async handleDetailedStatus(channelLogin, userLogin) {
+    try {
+      const config = await this.getCurrentConfig(channelLogin);
+      if (!config) {
+        await this.sendChatMessage(channelLogin, `EloWardBot: Not configured`);
+        return;
+      }
+
+      const status = config.bot_enabled ? '🟢 Active' : '🔴 Inactive';
+      const mode = config.enforcement_mode || 'has_rank';
+      const timeout = config.timeout_seconds || 30;
+      const minRank = (config.min_rank_tier && config.min_rank_division) 
+        ? `${config.min_rank_tier} ${config.min_rank_division}+` 
+        : 'Not set';
+      
+      await this.sendChatMessage(channelLogin, `EloWard Status: ${status} | Mode: ${mode} | Timeout: ${timeout}s | Min Rank: ${minRank}`);
+    } catch (error) {
+      console.error(`❌ Detailed status error:`, error.message);
+      await this.sendChatMessage(channelLogin, `Unable to get detailed status.`);
+    }
+  }
+
+  // Handle set subcommands
+  async handleSetCommand(channelLogin, userLogin, parts) {
+    const subcommand = parts[2]?.toLowerCase();
+    
+    switch (subcommand) {
+      case 'timeout':
+        if (parts[3] && !isNaN(parts[3])) {
+          const seconds = Math.max(1, Math.min(1209600, parseInt(parts[3])));
+          await this.updateChannelConfig(channelLogin, { timeout_seconds: seconds });
+          await this.sendChatMessage(channelLogin, `Timeout duration set to ${seconds} seconds`);
+          console.log(`⏱️ ${userLogin} set timeout to ${seconds}s in ${channelLogin}`);
+        } else {
+          await this.sendChatMessage(channelLogin, `Usage: !eloward set timeout [1-1209600]`);
+        }
+        break;
+
+      case 'min_rank':
+        if (parts[3] && parts[4]) {
+          const tier = parts[3].toUpperCase();
+          const division = this.normalizeDivision(parts[4]);
+          
+          // Validate tier
+          const validTiers = ['IRON', 'BRONZE', 'SILVER', 'GOLD', 'PLATINUM', 'EMERALD', 'DIAMOND', 'MASTER', 'GRANDMASTER', 'CHALLENGER'];
+          if (!validTiers.includes(tier)) {
+            await this.sendChatMessage(channelLogin, `Invalid tier. Valid tiers: ${validTiers.join(', ')}`);
+            return;
+          }
+          
+          // Validate division (Master+ don't have divisions)
+          const validDivisions = ['I', 'II', 'III', 'IV', 'V'];
+          const noDivisionTiers = ['MASTER', 'GRANDMASTER', 'CHALLENGER'];
+          
+          if (noDivisionTiers.includes(tier)) {
+            await this.updateChannelConfig(channelLogin, {
+              min_rank_tier: tier,
+              min_rank_division: 'I' // Set to I for consistency
+            });
+            await this.sendChatMessage(channelLogin, `Minimum rank set to ${tier}`);
+          } else {
+            if (!validDivisions.includes(division)) {
+              await this.sendChatMessage(channelLogin, `Invalid division. Use: I, II, III, IV, V (or 1, 2, 3, 4, 5)`);
+              return;
+            }
+            
+            await this.updateChannelConfig(channelLogin, {
+              min_rank_tier: tier,
+              min_rank_division: division
+            });
+            await this.sendChatMessage(channelLogin, `Minimum rank set to ${tier} ${division}`);
+          }
+          
+          console.log(`⚙️ ${userLogin} set minrank ${tier} ${division} in ${channelLogin}`);
+        } else {
+          await this.sendChatMessage(channelLogin, `Usage: !eloward set min_rank [tier] [division] (e.g. !eloward set min_rank gold 4)`);
+        }
+        break;
+
+      case 'reason':
+        if (parts.length > 3) {
+          // Join all parts from index 3 onwards to handle multi-word reasons
+          const reason = parts.slice(3).join(' ').replace(/"/g, '').trim();
+          if (reason) {
+            await this.updateChannelConfig(channelLogin, { reason_template: reason });
+            await this.sendChatMessage(channelLogin, `Timeout reason set to: "${reason}"`);
+            console.log(`⚙️ ${userLogin} set reason to "${reason}" in ${channelLogin}`);
+          } else {
+            await this.sendChatMessage(channelLogin, `Please provide a reason message`);
+          }
+        } else {
+          await this.sendChatMessage(channelLogin, `Usage: !eloward set reason [your custom message]`);
+        }
+        break;
+
+      default:
+        await this.sendChatMessage(channelLogin, `Set options: timeout, min_rank, reason. Use !eloward help for details.`);
     }
   }
 
