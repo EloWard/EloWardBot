@@ -601,7 +601,7 @@ class EloWardTwitchBot {
 
       // All other commands require mod/broadcaster privileges
       if (!isPrivileged) {
-        await this.sendChatMessage(channelLogin, `You don't have permission to use that command. Type !eloward help for available commands.`);
+        await this.sendChatMessage(channelLogin, `You don't have permission to use that command`);
         return;
       }
 
@@ -622,7 +622,7 @@ class EloWardTwitchBot {
         case 'mode':
           if (parts[2] === 'has_rank') {
             await this.updateChannelConfig(channelLogin, { enforcement_mode: 'has_rank' });
-            await this.sendChatMessage(channelLogin, `Mode set to has_rank. Chat restricted to subs and linked EloWard accounts.`);
+            await this.sendChatMessage(channelLogin, `Mode set to has_rank. Chat restricted to subs and viewers with ranks`);
             console.log(`⚙️ ${userLogin} set mode to has_rank in ${channelLogin}`);
           } else if (parts[2] === 'min_rank') {
             await this.updateChannelConfig(channelLogin, { enforcement_mode: 'min_rank' });
@@ -633,7 +633,7 @@ class EloWardTwitchBot {
             await this.sendChatMessage(channelLogin, `Mode set to min_rank${minRankMsg}`);
             console.log(`⚙️ ${userLogin} set mode to min_rank in ${channelLogin}`);
           } else {
-            await this.sendChatMessage(channelLogin, `Invalid mode. Use: !eloward mode has_rank OR !eloward mode min_rank`);
+            await this.sendChatMessage(channelLogin, `Invalid mode. Use has_rank OR min_rank`);
           }
           break;
 
@@ -646,12 +646,12 @@ class EloWardTwitchBot {
           break;
 
         default:
-          await this.sendChatMessage(channelLogin, `Unknown command "${command}". Type !eloward help for available commands.`);
+          await this.sendChatMessage(channelLogin, `Unknown command. Type !eloward help for available commands`);
           console.log(`❓ Unknown command from ${userLogin} in ${channelLogin}: ${message}`);
       }
     } catch (error) {
       console.error(`❌ Chat command error from ${userLogin} in ${channelLogin}:`, error.message);
-      await this.sendChatMessage(channelLogin, `Command failed. Please try again.`);
+      await this.sendChatMessage(channelLogin, `Command failed please try again`);
     }
   }
 
@@ -661,7 +661,7 @@ class EloWardTwitchBot {
       const config = await this.getCurrentConfig(channelLogin);
       
       if (!config || !config.bot_enabled) {
-        const baseMsg = `EloWardBot is not enforcing right now.`;
+        const baseMsg = `EloWardBot is not enforcing right now`;
         const fullMsg = isPrivileged ? `${baseMsg} For a list of commands, type !eloward help` : baseMsg;
         await this.sendChatMessage(channelLogin, fullMsg);
         return;
@@ -728,7 +728,7 @@ class EloWardTwitchBot {
           await this.sendChatMessage(channelLogin, `Timeout duration set to ${seconds} seconds`);
           console.log(`⏱️ ${userLogin} set timeout to ${seconds}s in ${channelLogin}`);
         } else {
-          await this.sendChatMessage(channelLogin, `Usage: !eloward set timeout [1-1209600]`);
+          await this.sendChatMessage(channelLogin, `Correct usage: !eloward set timeout [1-1209600]`);
         }
         break;
 
@@ -756,7 +756,7 @@ class EloWardTwitchBot {
             await this.sendChatMessage(channelLogin, `Minimum rank set to ${tier}`);
           } else {
             if (!validDivisions.includes(division)) {
-              await this.sendChatMessage(channelLogin, `Invalid division. Use: I, II, III, IV, V (or 1, 2, 3, 4, 5)`);
+              await this.sendChatMessage(channelLogin, `Invalid division. Use: I, II, III, IV (or 1, 2, 3, 4)`);
               return;
             }
             
@@ -790,7 +790,7 @@ class EloWardTwitchBot {
         break;
 
       default:
-        await this.sendChatMessage(channelLogin, `Set options: timeout, min_rank, reason. Use !eloward help for details.`);
+        await this.sendChatMessage(channelLogin, `Unknown subcommand. Use !eloward help for details`);
     }
   }
 
