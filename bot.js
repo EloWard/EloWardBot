@@ -669,9 +669,9 @@ class EloWardTwitchBot {
 
       let statusMsg;
       if (config.enforcement_mode === 'min_rank' && config.min_rank_tier && config.min_rank_division) {
-        statusMsg = `Chat is restricted to subs, and accounts linked with EloWard that are ${config.min_rank_tier} ${config.min_rank_division} or above. Link your rank at eloward.com`;
+        statusMsg = `Chat is restricted to subs, and viewers ranked ${config.min_rank_tier} ${config.min_rank_division} or above. Link your rank at eloward.com`;
       } else {
-        statusMsg = `Chat is restricted to subs, and accounts linked with EloWard. Link your rank at eloward.com`;
+        statusMsg = `Chat is restricted to subs, and accounts with ranks. Link your rank at eloward.com`;
       }
       
       const fullMsg = isPrivileged ? `${statusMsg} | For a list of commands, type !eloward help` : statusMsg;
