@@ -566,8 +566,8 @@ class EloWardTwitchBot {
   // Convert division formats (4 -> IV, IV -> IV, etc)
   normalizeDivision(division) {
     const divisionMap = {
-      '1': 'I', '2': 'II', '3': 'III', '4': 'IV', '5': 'V',
-      'I': 'I', 'II': 'II', 'III': 'III', 'IV': 'IV', 'V': 'V'
+      '1': 'I', '2': 'II', '3': 'III', '4': 'IV',
+      'I': 'I', 'II': 'II', 'III': 'III', 'IV': 'IV'
     };
     return divisionMap[division.toUpperCase()] || division.toUpperCase();
   }
@@ -661,7 +661,7 @@ class EloWardTwitchBot {
       const config = await this.getCurrentConfig(channelLogin);
       
       if (!config || !config.bot_enabled) {
-        const baseMsg = `EloWardBot is not enforcing right now`;
+        const baseMsg = `EloWardBot is not enforcing right now. Link your rank at eloward.com`;
         const fullMsg = isPrivileged ? `${baseMsg} For a list of commands, type !eloward help` : baseMsg;
         await this.sendChatMessage(channelLogin, fullMsg);
         return;
@@ -689,8 +689,21 @@ class EloWardTwitchBot {
       return;
     }
 
-    const helpMsg = `EloWard Commands: !eloward on/off | !eloward mode has_rank/min_rank | !eloward set timeout [seconds] | !eloward set min_rank [tier] [division] | !eloward set reason [text] | !eloward status (detailed info)`;
-    await this.sendChatMessage(channelLogin, helpMsg);
+    const helpLines = [
+      'EloWard Commands:',
+      '!eloward on/off - Enable/disable bot',
+      '!eloward mode has_rank/min_rank - Set enforcement mode', 
+      '!eloward set timeout [seconds] - Set timeout duration',
+      '!eloward set min_rank [tier] [division] - Set minimum rank',
+      '!eloward set reason [text] - Set timeout message',
+      '!eloward status - Show detailed configuration'
+    ];
+    
+    for (const line of helpLines) {
+      await this.sendChatMessage(channelLogin, line);
+      // Small delay to prevent message rate limiting
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
   }
 
   // Handle detailed status for mods
@@ -745,7 +758,7 @@ class EloWardTwitchBot {
           }
           
           // Validate division (Master+ don't have divisions)
-          const validDivisions = ['I', 'II', 'III', 'IV', 'V'];
+          const validDivisions = ['I', 'II', 'III', 'IV'];
           const noDivisionTiers = ['MASTER', 'GRANDMASTER', 'CHALLENGER'];
           
           if (noDivisionTiers.includes(tier)) {
