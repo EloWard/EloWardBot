@@ -688,22 +688,7 @@ class EloWardTwitchBot {
       await this.sendChatMessage(channelLogin, `@${userLogin} Available commands: !eloward (check status) | !eloward help (this message)`);
       return;
     }
-
-    const helpLines = [
-      'EloWard Commands:',
-      '!eloward on/off - Enable/disable bot',
-      '!eloward mode has_rank/min_rank - Set enforcement mode', 
-      '!eloward set timeout [seconds] - Set timeout duration',
-      '!eloward set min_rank [tier] [division] - Set minimum rank',
-      '!eloward set reason [text] - Set timeout message',
-      '!eloward status - Show detailed configuration'
-    ];
-    
-    for (const line of helpLines) {
-      await this.sendChatMessage(channelLogin, line);
-      // Small delay to prevent message rate limiting
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
+    await this.sendChatMessage(channelLogin, `@${userLogin} Full command list: https://www.eloward.com/setup/bot#commands-reference`);
   }
 
   // Handle detailed status for mods
@@ -746,9 +731,9 @@ class EloWardTwitchBot {
         break;
 
       case 'min_rank':
-        if (parts[3] && parts[4]) {
+        if (parts[3]) {
           const tier = parts[3].toUpperCase();
-          const division = this.normalizeDivision(parts[4]);
+          const divisionInput = parts[4] ? this.normalizeDivision(parts[4]) : null;
           
           // Validate tier
           const validTiers = ['IRON', 'BRONZE', 'SILVER', 'GOLD', 'PLATINUM', 'EMERALD', 'DIAMOND', 'MASTER', 'GRANDMASTER', 'CHALLENGER'];
@@ -757,32 +742,38 @@ class EloWardTwitchBot {
             return;
           }
           
-          // Validate division (Master+ don't have divisions)
-          const validDivisions = ['I', 'II', 'III', 'IV'];
           const noDivisionTiers = ['MASTER', 'GRANDMASTER', 'CHALLENGER'];
           
+          // Master+ ranks: ignore any provided division, always set to I in database
           if (noDivisionTiers.includes(tier)) {
             await this.updateChannelConfig(channelLogin, {
               min_rank_tier: tier,
-              min_rank_division: 'I' // Set to I for consistency
+              min_rank_division: 'I' // Always I for Master+ ranks
             });
             await this.sendChatMessage(channelLogin, `Minimum rank set to ${tier}`);
+            console.log(`⚙️ ${userLogin} set minrank ${tier} in ${channelLogin}`);
           } else {
-            if (!validDivisions.includes(division)) {
+            // Regular tiers (Iron-Diamond): require and validate division
+            if (!divisionInput) {
+              await this.sendChatMessage(channelLogin, `${tier} requires a division. Usage: !eloward set min_rank ${tier.toLowerCase()} [1-4]`);
+              return;
+            }
+            
+            const validDivisions = ['I', 'II', 'III', 'IV'];
+            if (!validDivisions.includes(divisionInput)) {
               await this.sendChatMessage(channelLogin, `Invalid division. Use: I, II, III, IV (or 1, 2, 3, 4)`);
               return;
             }
             
             await this.updateChannelConfig(channelLogin, {
               min_rank_tier: tier,
-              min_rank_division: division
+              min_rank_division: divisionInput
             });
-            await this.sendChatMessage(channelLogin, `Minimum rank set to ${tier} ${division}`);
+            await this.sendChatMessage(channelLogin, `Minimum rank set to ${tier} ${divisionInput}`);
+            console.log(`⚙️ ${userLogin} set minrank ${tier} ${divisionInput} in ${channelLogin}`);
           }
-          
-          console.log(`⚙️ ${userLogin} set minrank ${tier} ${division} in ${channelLogin}`);
         } else {
-          await this.sendChatMessage(channelLogin, `Usage: !eloward set min_rank [tier] [division] (e.g. !eloward set min_rank gold 4)`);
+          await this.sendChatMessage(channelLogin, `Usage: !eloward set min_rank [tier] [division]`);
         }
         break;
 
