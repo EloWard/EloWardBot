@@ -309,7 +309,7 @@ class EloWardTwitchBot {
     // Handle !commands command (separate from !eloward commands)
     if (message === '!commands' && connection === 'primary') {
       console.log(`🎯 Commands command detected: ${userLogin} in ${channelLogin}`);
-      await this.sendChatMessage(channelLogin, `@${userLogin} Full commands list can be found here: https://www.eloward.com/setup/bot#commands-reference`);
+      await this.sendChatMessage(channelLogin, `@${userLogin} Full command list: https://www.eloward.com/setup/bot#commands-reference`);
       return;
     }
 
