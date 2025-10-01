@@ -306,6 +306,13 @@ class EloWardTwitchBot {
       return this.handleChatCommand(channelLogin, userLogin, message, event);
     }
 
+    // Handle !commands command (separate from !eloward commands)
+    if (message === '!commands' && connection === 'primary') {
+      console.log(`🎯 Commands command detected: ${userLogin} in ${channelLogin}`);
+      await this.sendChatMessage(channelLogin, `@${userLogin} Full commands list can be found here: https://www.eloward.com/setup/bot#commands-reference`);
+      return;
+    }
+
     try {
       // Step 1: Get channel config (cache hit = instant decision)
       let config = this.getCachedConfig(channelLogin);
@@ -683,11 +690,7 @@ class EloWardTwitchBot {
   }
 
   // Handle !eloward help command
-  async handleHelpCommand(channelLogin, userLogin, isPrivileged) {
-    if (!isPrivileged) {
-      await this.sendChatMessage(channelLogin, `@${userLogin} Available commands: !eloward (check status) | !eloward help (this message)`);
-      return;
-    }
+  async handleHelpCommand(channelLogin, userLogin) {
     await this.sendChatMessage(channelLogin, `@${userLogin} Full command list: https://www.eloward.com/setup/bot#commands-reference`);
   }
 
