@@ -673,16 +673,14 @@ class EloWardTwitchBot {
         await this.sendChatMessage(channelLogin, fullMsg);
         return;
       }
-
       let statusMsg;
       if (config.enforcement_mode === 'min_rank' && config.min_rank_tier && config.min_rank_division) {
-        statusMsg = `Chat is restricted to subs, and viewers ranked ${config.min_rank_tier} ${config.min_rank_division} or above. Link your rank at eloward.com`;
+        statusMsg = `Chat is currently restricted to subs, and viewers ranked ${config.min_rank_tier} ${config.min_rank_division} or above. Link your rank at eloward.com`;
       } else {
-        statusMsg = `Chat is restricted to subs, and accounts with ranks. Link your rank at eloward.com`;
+        statusMsg = `Chat is currently restricted to subs, and accounts with ranks. Link your rank at eloward.com`;
       }
       
-      const fullMsg = isPrivileged ? `${statusMsg} | For a list of commands, type !eloward help` : statusMsg;
-      await this.sendChatMessage(channelLogin, fullMsg);
+      await this.sendChatMessage(channelLogin, statusMsg);
     } catch (error) {
       console.error(`❌ Status command error:`, error.message);
       await this.sendChatMessage(channelLogin, `Unable to check status. Please try again.`);
@@ -706,11 +704,18 @@ class EloWardTwitchBot {
       const status = config.bot_enabled ? '🟢 Active' : '🔴 Inactive';
       const mode = config.enforcement_mode || 'has_rank';
       const timeout = config.timeout_seconds || 30;
-      const minRank = (config.min_rank_tier && config.min_rank_division) 
-        ? `${config.min_rank_tier} ${config.min_rank_division}+` 
-        : 'Not set';
       
-      await this.sendChatMessage(channelLogin, `EloWard Status: ${status} | Mode: ${mode} | Timeout: ${timeout}s | Min Rank: ${minRank}`);
+      let statusMessage = `EloWardBot Status: ${status} | Mode: ${mode} | Timeout: ${timeout}s`;
+      
+      // Only include min rank in the message if the mode is min_rank
+      if (mode === 'min_rank') {
+        const minRank = (config.min_rank_tier && config.min_rank_division) 
+          ? `${config.min_rank_tier} ${config.min_rank_division}+` 
+          : 'Not set';
+        statusMessage += ` | Min Rank: ${minRank}`;
+      }
+      
+      await this.sendChatMessage(channelLogin, statusMessage);
     } catch (error) {
       console.error(`❌ Detailed status error:`, error.message);
       await this.sendChatMessage(channelLogin, `Unable to get detailed status.`);
