@@ -669,7 +669,7 @@ class EloWardTwitchBot {
       
       if (!config || !config.bot_enabled) {
         const baseMsg = `EloWardBot is not enforcing right now. Link your rank at eloward.com`;
-        const fullMsg = isPrivileged ? `${baseMsg} For a list of commands, type !eloward help` : baseMsg;
+        const fullMsg = isPrivileged ? `${baseMsg}. For a list of commands, type !eloward help` : baseMsg;
         await this.sendChatMessage(channelLogin, fullMsg);
         return;
       }
