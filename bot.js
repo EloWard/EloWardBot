@@ -23,6 +23,7 @@ class EloWardTwitchBot {
     // Local caches with TTL (production optimization)
     this.configCache = new Map(); // channel -> {config, expires}  
     this.rankCache = new Map();   // user -> {hasRank, expires}
+    this.expectedChannels = new Set(); // Track channels we should be in - MUST be initialized!
     
     // Redis for instant config updates
     this.redis = null;
@@ -223,16 +224,12 @@ class EloWardTwitchBot {
 
   setupEventHandlers() {
     // Primary connection event handlers
-    this.primaryBot.on('registered', () => {
+    this.primaryBot.on('registered', async () => {
       console.log('✅ Primary IRC connection established!');
       this.reconnectAttempts = 0;
-      this.loadChannels();
       
-      // Post-startup channel check
-      setTimeout(() => {
-        console.log('🔄 Post-startup channel sync...');
-        this.reloadChannels();
-      }, 5000);
+      // Always load channels after connection
+      await this.loadChannels();
     });
 
     this.primaryBot.on('privmsg', (event) => this.handleMessage(event, 'primary'));
@@ -240,8 +237,22 @@ class EloWardTwitchBot {
     this.primaryBot.on('close', () => this.handleConnectionError(new Error('Primary connection closed'), 'primary'));
 
     // Secondary connection event handlers  
-    this.secondaryBot.on('registered', () => {
+    this.secondaryBot.on('registered', async () => {
       console.log('✅ Secondary IRC connection established for resilience!');
+      
+      // Restore secondary channels after reconnection (only if expectedChannels is populated)
+      if (this.expectedChannels && this.expectedChannels.size > this.maxChannelsPerConnection) {
+        const allChannels = Array.from(this.expectedChannels);
+        const secondaryChannels = allChannels.slice(this.maxChannelsPerConnection);
+        
+        console.log(`🔄 Restoring ${secondaryChannels.length} channels on secondary connection...`);
+        for (const channel of secondaryChannels) {
+          this.secondaryBot.join(`#${channel}`);
+          const existing = this.channels.get(channel) || { primary: false, secondary: false };
+          this.channels.set(channel, { ...existing, secondary: true });
+          await new Promise(resolve => setTimeout(resolve, 667)); // Rate limit
+        }
+      }
     });
 
     this.secondaryBot.on('privmsg', (event) => this.handleMessage(event, 'secondary'));
@@ -834,7 +845,7 @@ class EloWardTwitchBot {
     }
   }
 
-  // Channel loading from Worker with dual connection distribution (75-80 channels each)
+  // Channel loading from Worker - load ALL channels and stay in them 24/7
   async loadChannels() {
     try {
       console.log('📡 Loading channels from Worker (always-on presence model)...');
@@ -845,28 +856,33 @@ class EloWardTwitchBot {
       }
       
       const { channels } = await response.json();
-      console.log(`📋 Found ${channels.length} total channels to join`);
+      console.log(`📋 Found ${channels.length} total channels to join (bot stays in ALL channels 24/7)`);
       
-      // Distribute channels across both connections (max 80 per connection per README)
+      // Store expected channels - this is our source of truth
+      this.expectedChannels.clear();
+      channels.forEach(channel => this.expectedChannels.add(channel));
+      
+      // Clear and rebuild channel map
+      this.channels.clear();
+      
+      // Distribute channels across both connections (max 80 per connection)
       const primaryChannels = channels.slice(0, this.maxChannelsPerConnection);
       const secondaryChannels = channels.slice(this.maxChannelsPerConnection, this.maxChannelsPerConnection * 2);
       
-      console.log(`🎯 Joining ${primaryChannels.length} channels on primary connection with anti-spam throttling...`);
+      console.log(`🎯 Joining ${primaryChannels.length} channels on primary connection...`);
       
-      // Join channels on primary connection with conservative rate limiting
+      // Join channels on primary connection with rate limiting
       for (let i = 0; i < primaryChannels.length; i++) {
         const channel = primaryChannels[i];
         this.primaryBot.join(`#${channel}`);
         this.channels.set(channel, { primary: true, secondary: false });
-        console.log(`📥 Joined (primary): #${channel} (${i + 1}/${primaryChannels.length})`);
         
         // Conservative rate limit: 15 joins per 10 seconds = 667ms between joins
-        // This prevents Twitch spam detection while maintaining reasonable startup time
         await new Promise(resolve => setTimeout(resolve, 667));
         
         // Progress logging every 10 channels
         if ((i + 1) % 10 === 0) {
-          console.log(`📊 Primary connection progress: ${i + 1}/${primaryChannels.length} channels joined`);
+          console.log(`📊 Primary: ${i + 1}/${primaryChannels.length} channels joined`);
         }
       }
       
@@ -877,18 +893,12 @@ class EloWardTwitchBot {
         for (let i = 0; i < secondaryChannels.length; i++) {
           const channel = secondaryChannels[i];
           this.secondaryBot.join(`#${channel}`);
-          this.channels.set(channel, { 
-            primary: this.channels.has(channel) ? this.channels.get(channel).primary : false, 
-            secondary: true 
-          });
-          console.log(`📥 Joined (secondary): #${channel} (${i + 1}/${secondaryChannels.length})`);
+          this.channels.set(channel, { primary: false, secondary: true });
           
-          // Conservative rate limit: 15 joins per 10 seconds = 667ms between joins
           await new Promise(resolve => setTimeout(resolve, 667));
           
-          // Progress logging every 10 channels
           if ((i + 1) % 10 === 0) {
-            console.log(`📊 Secondary connection progress: ${i + 1}/${secondaryChannels.length} channels joined`);
+            console.log(`📊 Secondary: ${i + 1}/${secondaryChannels.length} channels joined`);
           }
         }
       }
@@ -901,68 +911,8 @@ class EloWardTwitchBot {
     }
   }
 
-  // Reload channels with dual connection support - join new, leave removed
-  async reloadChannels() {
-    try {
-      console.log('🔍 Reloading channel list...');
-      const response = await fetch(`${this.WORKER_URL}/channels`);
-      
-      if (!response.ok) {
-        console.log(`⚠️ Channel reload failed: HTTP ${response.status}`);
-        return;
-      }
-      
-      const { channels: newChannels } = await response.json();
-      const newChannelSet = new Set(newChannels);
-      const currentChannels = Array.from(this.channels.keys());
-      
-      const channelsToJoin = newChannels.filter(channel => !this.channels.has(channel));
-      const channelsToLeave = currentChannels.filter(channel => !newChannelSet.has(channel));
-      
-      // Join new channels with dual connection distribution
-        for (const channel of channelsToJoin) {
-        const primaryChannelCount = Array.from(this.channels.values()).filter(c => c.primary).length;
-        const usePrimary = primaryChannelCount < this.maxChannelsPerConnection;
-        
-        if (usePrimary) {
-          this.primaryBot.join(`#${channel}`);
-          this.channels.set(channel, { primary: true, secondary: false });
-          console.log(`📥 Joined (primary): #${channel}`);
-        } else {
-          this.secondaryBot.join(`#${channel}`);
-          this.channels.set(channel, { primary: false, secondary: true });
-          console.log(`📥 Joined (secondary): #${channel}`);
-        }
-        
-        await new Promise(resolve => setTimeout(resolve, 500));
-      }
-      
-      // Leave removed channels from both connections
-        for (const channel of channelsToLeave) {
-        const channelInfo = this.channels.get(channel);
-        if (channelInfo?.primary) {
-          this.primaryBot.part(`#${channel}`);
-        }
-        if (channelInfo?.secondary) {
-          this.secondaryBot.part(`#${channel}`);
-        }
-        this.channels.delete(channel);
-        console.log(`📤 Left: #${channel}`);
-        await new Promise(resolve => setTimeout(resolve, 200));
-      }
-      
-      if (channelsToJoin.length === 0 && channelsToLeave.length === 0) {
-        console.log('✅ No channel changes detected');
-      } else {
-        const primaryCount = Array.from(this.channels.values()).filter(c => c.primary).length;
-        const secondaryCount = Array.from(this.channels.values()).filter(c => c.secondary).length;
-        console.log(`🔄 Channel reload complete. Now in ${this.channels.size} channels (${primaryCount} primary, ${secondaryCount} secondary)`);
-      }
-      
-    } catch (error) {
-      console.error('❌ Channel reload failed:', error.message);
-    }
-  }
+  // Removed reloadChannels - bot stays in all channels 24/7
+  // Config changes only affect Standby/Enforcing mode, not channel membership
 
   // Redis subscription for instant config updates (1-3s propagation)
   startRedisSubscription() {
@@ -985,15 +935,15 @@ class EloWardTwitchBot {
             console.log('⚡ Redis config update:', data.type, data.channel_login);
             
             if (data.type === 'config_update' && data.channel_login) {
-              // Invalidate cache for instant effect
+              // Invalidate cache for instant effect - bot stays in channel, just changes mode
               const hadCache = this.configCache.has(data.channel_login);
               this.configCache.delete(data.channel_login);
               console.log(`🗑️  Cache invalidated for ${data.channel_login} (had cache: ${hadCache}, fields: ${JSON.stringify(data.fields)})`);
               
-              // Check if this affects channel membership
+              // Log mode change but DON'T reload channels - bot stays joined 24/7
               if (data.fields?.bot_enabled !== undefined) {
-                console.log('🚀 Instant channel membership change:', data.channel_login, data.fields.bot_enabled);
-                setTimeout(() => this.reloadChannels(), 1000);
+                const mode = data.fields.bot_enabled ? 'Enforcing' : 'Standby';
+                console.log(`⚡ Mode changed for ${data.channel_login}: ${mode} (bot remains in channel)`);
               }
             }
           } catch (error) {
