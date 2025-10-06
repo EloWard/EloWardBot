@@ -679,16 +679,16 @@ class EloWardTwitchBot {
       const config = await this.getCurrentConfig(channelLogin);
       
       if (!config || !config.bot_enabled) {
-        const baseMsg = `EloWardBot is not enforcing right now. Link your rank at eloward.com. Show peak rank with EloWard Plus`;
+        const baseMsg = `EloWardBot is not enforcing right now || Link your rank at eloward.com and show peak rank with EloWard Plus`;
         const fullMsg = isPrivileged ? `${baseMsg}. For a list of commands, type !eloward help` : baseMsg;
         await this.sendChatMessage(channelLogin, fullMsg);
         return;
       }
       let statusMsg;
       if (config.enforcement_mode === 'min_rank' && config.min_rank_tier && config.min_rank_division) {
-        statusMsg = `Chat is currently restricted to subs, and viewers ranked ${config.min_rank_tier} ${config.min_rank_division} or above. Link your rank at eloward.com Show peak rank with EloWard Plus`;
+        statusMsg = `Chat is currently restricted to subs, and viewers ranked ${config.min_rank_tier} ${config.min_rank_division} or above || Link your rank at eloward.com and show peak rank with EloWard Plus`;
       } else {
-        statusMsg = `Chat is currently restricted to subs, and accounts with ranks. Link your rank at eloward.com Show peak rank with EloWard Plus`;
+        statusMsg = `Chat is currently restricted to subs, and viewers with ranks || Link your rank at eloward.com and show peak rank with EloWard Plus`;
       }
       
       await this.sendChatMessage(channelLogin, statusMsg);
