@@ -347,9 +347,9 @@ class EloWardTwitchBot {
 
       console.log(`🤖 Bot active in ${channelLogin}, processing message from ${userLogin} (config cached: ${configCached})`);
 
-      // Step 2: Check if user is exempt (broadcaster/mod/vip based on config)
-      if (this.isUserExempt(userLogin, channelLogin, event, config)) {
-        console.log(`👑 User ${userLogin} is exempt in ${channelLogin}, allowing message`);
+      // Step 2: Check if user is exempt (hard-coded: broadcaster/mod/sub)
+      if (this.isUserEnforcementExempt(event, channelLogin)) {
+        console.log(`👑 Enforcement exempt (broadcaster/mod/sub): ${userLogin} in ${channelLogin}`);
         return;
       }
 
@@ -374,7 +374,7 @@ class EloWardTwitchBot {
       
       if (shouldTimeout) {
         console.log(`🔨 Executing timeout for ${userLogin} in ${channelLogin}...`);
-        await this.executeTimeout(channelLogin, userLogin, config);
+        await this.executeTimeout(channelLogin, userLogin, config, event);
         const duration = Date.now() - startTime;
         console.log(`⏱️  Message decision: TIMEOUT ${userLogin} in ${channelLogin} (${duration}ms)`);
       } else {
@@ -443,31 +443,6 @@ class EloWardTwitchBot {
     }
   }
 
-  // Check if user should be exempt from enforcement
-  isUserExempt(userLogin, channelLogin, event, config) {
-    // Always exempt broadcaster
-    if (userLogin.toLowerCase() === channelLogin.toLowerCase()) {
-      return true;
-    }
-
-    // Check IRC badges from event
-    const badges = event.tags?.badges || '';
-    const ignoreRoles = (config.ignore_roles || 'broadcaster,moderator').toLowerCase();
-    
-    if (ignoreRoles.includes('moderator') && badges.includes('moderator/')) {
-      return true;
-    }
-    
-    if (ignoreRoles.includes('vip') && badges.includes('vip/')) {
-      return true;
-    }
-    
-    if (ignoreRoles.includes('subscriber') && badges.includes('subscriber/')) {
-      return true;
-    }
-
-    return false;
-  }
 
   // Enforcement logic based on config - FAIL-OPEN design
   // Note: hasRank=true on system errors (fetchUserRank catch block) to avoid timeouts during outages
@@ -490,8 +465,14 @@ class EloWardTwitchBot {
   }
 
   // Execute timeout via Twitch Helix API (bot calls directly)  
-  async executeTimeout(channelLogin, userLogin, config) {
+  async executeTimeout(channelLogin, userLogin, config, event) {
     try {
+      // Hard safety: never timeout streamer/mod/sub even if called by mistake
+      if (this.isUserEnforcementExempt(event, channelLogin)) {
+        console.log(`🛡️ Skipping timeout for privileged user (broadcaster/mod/sub): ${userLogin} in ${channelLogin}`);
+        return;
+      }
+
       const duration = config.timeout_seconds || 30;
       const reasonTemplate = config.reason_template || 'not enough elo to speak. type !eloward';
       
@@ -510,6 +491,12 @@ class EloWardTwitchBot {
       const userId = userInfo[userLogin].id;
       const broadcasterId = userInfo[channelLogin].id;
       const botUserId = userInfo['elowardbot'].id;
+
+      // Helix mod recheck (best-effort)
+      if (await this.isModeratorViaHelix(broadcasterId, userId)) {
+        console.log(`🛡️ Helix says user is a moderator; skipping timeout: ${userLogin}`);
+        return;
+      }
 
       console.log(`🔍 Timeout attempt: ${userLogin}(${userId}) in ${channelLogin}(${broadcasterId}) for ${duration}s (bot: ${botUserId})`);
 
@@ -590,6 +577,56 @@ class EloWardTwitchBot {
     return divisionMap[division.toUpperCase()] || division.toUpperCase();
   }
 
+  // ---- Role helpers (robust + fast) ----
+  parseBadges(badgesStr = '') {
+    // badges come like "broadcaster/1,subscriber/12,moderator/1,vip/1,founder/0"
+    return new Set(
+      String(badgesStr || '')
+        .split(',')
+        .map(s => s.trim().toLowerCase())
+        .filter(Boolean)
+    );
+  }
+
+  getUserRoles(event, channelLogin) {
+    const badges = this.parseBadges(event?.tags?.badges);
+    const isBroadcaster = badges.has('broadcaster/1') || (event?.nick?.toLowerCase() === channelLogin?.toLowerCase());
+    const isModerator  = badges.has('moderator/1') || event?.tags?.mod === '1';
+    const isSubscriber = badges.has('subscriber/1') || badges.has('founder/0') || badges.has('founder/1');
+    const isVip        = badges.has('vip/1');
+    return { isBroadcaster, isModerator, isSubscriber, isVip };
+  }
+
+  // Enforcement exemptions: ALWAYS ignore streamer, mods, subs (config-independent)
+  isUserEnforcementExempt(event, channelLogin) {
+    const { isBroadcaster, isModerator, isSubscriber } = this.getUserRoles(event, channelLogin);
+    return isBroadcaster || isModerator || isSubscriber;
+  }
+
+  // Command privilege: ONLY broadcaster or moderator (subs not privileged)
+  isUserCommandPrivileged(event, channelLogin) {
+    const { isBroadcaster, isModerator } = this.getUserRoles(event, channelLogin);
+    return isBroadcaster || isModerator;
+  }
+
+  // Best-effort moderator recheck via Helix (optional extra safety)
+  async isModeratorViaHelix(broadcasterId, userId) {
+    try {
+      const url = `https://api.twitch.tv/helix/moderation/moderators?broadcaster_id=${broadcasterId}&user_id=${userId}`;
+      const resp = await fetch(url, {
+        headers: {
+          'Authorization': `Bearer ${this.currentToken.replace('oauth:', '')}`,
+          'Client-Id': process.env.TWITCH_CLIENT_ID || 'your-client-id'
+        }
+      });
+      if (!resp.ok) return false;
+      const data = await resp.json();
+      return Array.isArray(data.data) && data.data.length > 0;
+    } catch (_) {
+      return false; // fail-open here so we don't block enforcement on API hiccups
+    }
+  }
+
   // Get current config for status display
   async getCurrentConfig(channelLogin) {
     let config = this.getCachedConfig(channelLogin);
@@ -605,7 +642,7 @@ class EloWardTwitchBot {
     try {
       const parts = message.split(' ');
       const command = parts[1]?.toLowerCase();
-      const isPrivileged = this.isUserExempt(userLogin, channelLogin, event, { ignore_roles: 'broadcaster,moderator' });
+      const isPrivileged = this.isUserCommandPrivileged(event, channelLogin);
       
       // Handle base !eloward command (anyone can use)
       if (!command || command === '') {
