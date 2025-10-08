@@ -155,16 +155,64 @@ class EloWardTwitchBot {
   getCachedRank(userLogin) {
     const cached = this.rankCache.get(userLogin);
     if (cached && Date.now() < cached.expires) {
-      return { hasRank: cached.hasRank, cached: true };
+      return { 
+        hasRank: cached.hasRank, 
+        rankData: cached.rankData,
+        cached: true 
+      };
     }
     return null;
   }
 
-  setCachedRank(userLogin, hasRank) {
+  setCachedRank(userLogin, hasRank, rankData = null) {
     this.rankCache.set(userLogin, {
       hasRank,
+      rankData,
       expires: Date.now() + (hasRank ? 60000 : 30000) // 60s for valid, 30s for invalid
     });
+  }
+
+  // League of Legends rank comparison logic
+  getRankValue(tier, division) {
+    const tierValues = {
+      'IRON': 0,
+      'BRONZE': 100,
+      'SILVER': 200,
+      'GOLD': 300,
+      'PLATINUM': 400,
+      'EMERALD': 500,
+      'DIAMOND': 600,
+      'MASTER': 700,
+      'GRANDMASTER': 800,
+      'CHALLENGER': 900
+    };
+
+    const divisionValues = {
+      'IV': 0,
+      'III': 25,
+      'II': 50,
+      'I': 75
+    };
+
+    const tierValue = tierValues[tier?.toUpperCase()] ?? -1;
+    if (tierValue === -1) return -1;
+
+    // Master+ tiers don't have divisions
+    if (tierValue >= 700) return tierValue;
+
+    const divisionValue = divisionValues[division?.toUpperCase()] ?? 0;
+    return tierValue + divisionValue;
+  }
+
+  // Check if user's rank meets minimum requirement
+  meetsMinimumRank(userTier, userDivision, minTier, minDivision) {
+    const userValue = this.getRankValue(userTier, userDivision);
+    const minValue = this.getRankValue(minTier, minDivision);
+    
+    // If we can't determine rank values, fail open (allow)
+    if (userValue === -1 || minValue === -1) return true;
+    
+    return userValue >= minValue;
   }
 
   // PRODUCTION TOKEN MONITORING - Refresh before expiry + Channel reloading
@@ -360,15 +408,24 @@ class EloWardTwitchBot {
       if (!rankResult) {
         // Cache miss - HMAC call to Worker
         console.log(`🔍 Rank cache miss for ${userLogin}, fetching from Worker...`);
-        const hasRank = await this.fetchUserRank(userLogin);
-        this.setCachedRank(userLogin, hasRank);
-        rankResult = { hasRank, cached: false };
+        const fetchedRank = await this.fetchUserRank(userLogin);
+        this.setCachedRank(userLogin, fetchedRank.hasRank, fetchedRank.rankData);
+        rankResult = { 
+          hasRank: fetchedRank.hasRank, 
+          rankData: fetchedRank.rankData,
+          cached: false 
+        };
       }
 
-      console.log(`📊 Rank check for ${userLogin}: hasRank=${rankResult.hasRank} (cached: ${rankCached})`);
+      // Enhanced logging for min_rank mode
+      if (config.enforcement_mode === 'min_rank' && rankResult.rankData) {
+        console.log(`📊 Rank check for ${userLogin}: ${rankResult.rankData.rank_tier} ${rankResult.rankData.rank_division || ''} (cached: ${rankCached}, min: ${config.min_rank_tier} ${config.min_rank_division || ''})`);
+      } else {
+        console.log(`📊 Rank check for ${userLogin}: hasRank=${rankResult.hasRank} (cached: ${rankCached})`);
+      }
 
       // Step 4: Apply enforcement logic
-      const shouldTimeout = this.shouldTimeoutUser(rankResult.hasRank, config);
+      const shouldTimeout = this.shouldTimeoutUser(rankResult, config);
       
       console.log(`⚖️  Enforcement decision for ${userLogin} in ${channelLogin}: shouldTimeout=${shouldTimeout} (mode: ${config.enforcement_mode})`);
       
@@ -419,7 +476,7 @@ class EloWardTwitchBot {
     }
   }
 
-  // HMAC-secured rank fetch with caching
+  // HMAC-secured rank fetch with caching - returns full rank data
   async fetchUserRank(userLogin) {
     try {
       const path = '/rank:get';
@@ -433,32 +490,62 @@ class EloWardTwitchBot {
       });
 
       if (response.ok) {
-        return true; // User has valid rank
+        const data = await response.json();
+        return { 
+          hasRank: true,
+          rankData: data.rank_data || null
+        };
       } else {
-        return false; // No valid rank
+        return { 
+          hasRank: false,
+          rankData: null
+        };
       }
     } catch (error) {
       console.warn(`Rank fetch error for ${userLogin} - failing open (allowing message):`, error.message);
-      return true; // Fail open on errors - assume user has rank to avoid timeouts due to system issues
+      return { 
+        hasRank: true, // Fail open on errors
+        rankData: null
+      };
     }
   }
 
 
   // Enforcement logic based on config - FAIL-OPEN design
-  // Note: hasRank=true on system errors (fetchUserRank catch block) to avoid timeouts during outages
-  shouldTimeoutUser(hasRank, config) {
+  shouldTimeoutUser(rankResult, config) {
     if (!config.bot_enabled) return false;
 
     const mode = config.enforcement_mode || 'has_rank';
     
     if (mode === 'has_rank') {
-      return !hasRank; // Timeout if no rank badge (but hasRank=true on system errors)
+      return !rankResult.hasRank; // Timeout if no rank badge
     }
     
     if (mode === 'min_rank') {
-      // For minimum rank mode, we need rank details from Worker
-      // For now, treat as has_rank mode - can be enhanced later
-      return !hasRank; // (but hasRank=true on system errors)
+      // User must have a rank first
+      if (!rankResult.hasRank) return true;
+      
+      // Check if minimum rank is configured
+      if (!config.min_rank_tier) {
+        // No minimum configured, treat as has_rank mode
+        return false;
+      }
+      
+      // If we don't have rank data, fail open (allow)
+      if (!rankResult.rankData) return false;
+      
+      // Compare user's rank against minimum
+      const userTier = rankResult.rankData.rank_tier;
+      const userDivision = rankResult.rankData.rank_division;
+      
+      if (!userTier) return false; // Fail open if no tier data
+      
+      return !this.meetsMinimumRank(
+        userTier,
+        userDivision,
+        config.min_rank_tier,
+        config.min_rank_division
+      );
     }
     
     return false; // Default: allow message
