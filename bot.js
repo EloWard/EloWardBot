@@ -25,6 +25,9 @@ class EloWardTwitchBot {
     this.rankCache = new Map();   // user -> {hasRank, expires}
     this.expectedChannels = new Set(); // Track channels we should be in - MUST be initialized!
     
+    // Super admin hard-whitelist (case-insensitive)
+    this.superAdmins = new Set(['yomata1']);
+    
     // Redis for instant config updates
     this.redis = null;
     if (process.env.UPSTASH_REDIS_URL) {
@@ -575,6 +578,12 @@ class EloWardTwitchBot {
   // Execute timeout via Twitch Helix API (bot calls directly)  
   async executeTimeout(channelLogin, userLogin, config, event) {
     try {
+      // Super admin safety: never timeout super admin
+      if (this.isSuperAdmin(userLogin)) {
+        console.log(`🛡️ Super admin skip: ${userLogin} can't be timed out.`);
+        return;
+      }
+
       // Hard safety: never timeout streamer/mod/sub even if called by mistake
       if (this.isUserEnforcementExempt(event, channelLogin)) {
         console.log(`🛡️ Skipping timeout for privileged user (broadcaster/mod/sub): ${userLogin} in ${channelLogin}`);
@@ -582,12 +591,7 @@ class EloWardTwitchBot {
       }
 
       const duration = config.timeout_seconds || 30;
-      const reasonTemplate = config.reason_template || 'not enough elo to speak. type !eloward';
-      
-      const reason = reasonTemplate
-        .replace('{seconds}', duration)
-        .replace('{site}', 'https://eloward.com')
-        .replace('{user}', userLogin);
+      const reason = this.buildTimeoutReason(config, userLogin);
 
       // First, get user ID, broadcaster ID, and bot's own ID from Twitch API
       const userInfo = await this.getTwitchUserInfo([userLogin, channelLogin, 'elowardbot']);
@@ -685,7 +689,42 @@ class EloWardTwitchBot {
     return divisionMap[division.toUpperCase()] || division.toUpperCase();
   }
 
+  // Build timeout reason that auto-adapts to enforcement mode
+  buildTimeoutReason(config, userLogin) {
+    const mode = (config?.enforcement_mode || 'has_rank').toLowerCase();
+    const duration = config?.timeout_seconds || 30;
+
+    // Default reasons by mode
+    let defaultReason;
+    if (mode === 'min_rank') {
+      const tier = (config?.min_rank_tier || '').toUpperCase();
+      const noDivisionTiers = new Set(['MASTER', 'GRANDMASTER', 'CHALLENGER']);
+      const needsDivision = tier && !noDivisionTiers.has(tier);
+      const division = (config?.min_rank_division || '').toUpperCase();
+      if (tier) {
+        defaultReason = `you must be at least ${tier}${needsDivision && division ? ` ${division}` : ''} to type`;
+      } else {
+        defaultReason = 'you must meet the minimum rank to type';
+      }
+    } else {
+      // has_rank (default)
+      defaultReason = 'link your rank, go to eloward.com';
+    }
+
+    // Allow custom override via reason_template while preserving tokens
+    const template = (config?.reason_template || defaultReason);
+
+    return template
+      .replace('{seconds}', String(duration))
+      .replace('{site}', 'https://eloward.com')
+      .replace('{user}', userLogin);
+  }
+
   // ---- Role helpers (robust + fast) ----
+  isSuperAdmin(login) {
+    return this.superAdmins.has(String(login || '').toLowerCase());
+  }
+
   parseBadges(badgesStr = '') {
     return new Set(
       String(badgesStr || '')
@@ -729,14 +768,20 @@ class EloWardTwitchBot {
     return { isBroadcaster, isModerator, isSubscriber, isVip };
   }
 
-  // Enforcement exemptions: ALWAYS ignore streamer, mods, subs (config-independent)
+  // Enforcement exemptions: ALWAYS ignore streamer, mods, subs, super admins (config-independent)
   isUserEnforcementExempt(event, channelLogin) {
+    const nick = (event?.nick || '').toLowerCase();
+    if (this.isSuperAdmin(nick)) return true; // Super admin: always exempt
+
     const { isBroadcaster, isModerator, isSubscriber } = this.getUserRoles(event, channelLogin);
     return isBroadcaster || isModerator || isSubscriber;
   }
 
-  // Command privilege: ONLY broadcaster or moderator (subs not privileged)
+  // Command privilege: broadcaster, moderator, or super admin
   isUserCommandPrivileged(event, channelLogin) {
+    const nick = (event?.nick || '').toLowerCase();
+    if (this.isSuperAdmin(nick)) return true; // Super admin: always privileged
+
     const { isBroadcaster, isModerator } = this.getUserRoles(event, channelLogin);
     return isBroadcaster || isModerator;
   }
@@ -849,7 +894,7 @@ class EloWardTwitchBot {
       
       if (!config || !config.bot_enabled) {
         const baseMsg = `EloWardBot is not enforcing right now || Link your rank at eloward.com and show peak rank with EloWard Plus`;
-        const fullMsg = isPrivileged ? `${baseMsg}. For a list of commands, type !eloward help` : baseMsg;
+        const fullMsg = isPrivileged ? `${baseMsg} || For a list of commands, type !eloward help` : baseMsg;
         await this.sendChatMessage(channelLogin, fullMsg);
         return;
       }
