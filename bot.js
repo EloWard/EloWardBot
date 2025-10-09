@@ -276,6 +276,10 @@ class EloWardTwitchBot {
       console.log('✅ Primary IRC connection established!');
       this.reconnectAttempts = 0;
       
+      // Request Twitch-specific IRCv3 capabilities for tags, commands, and membership
+      console.log('🔧 Requesting Twitch IRCv3 capabilities for primary connection...');
+      this.primaryBot.raw('CAP REQ :twitch.tv/tags twitch.tv/commands twitch.tv/membership');
+      
       // Always load channels after connection
       await this.loadChannels();
     });
@@ -287,6 +291,10 @@ class EloWardTwitchBot {
     // Secondary connection event handlers  
     this.secondaryBot.on('registered', async () => {
       console.log('✅ Secondary IRC connection established for resilience!');
+      
+      // Request Twitch-specific IRCv3 capabilities for tags, commands, and membership
+      console.log('🔧 Requesting Twitch IRCv3 capabilities for secondary connection...');
+      this.secondaryBot.raw('CAP REQ :twitch.tv/tags twitch.tv/commands twitch.tv/membership');
       
       // Restore secondary channels after reconnection (only if expectedChannels is populated)
       if (this.expectedChannels && this.expectedChannels.size > this.maxChannelsPerConnection) {
@@ -344,12 +352,22 @@ class EloWardTwitchBot {
           this.secondaryBot.connect(connectionConfig);
         } else {
           // Fallback: reconnect both
-        await this.connectToTwitch();
+          await this.connectToTwitch();
         }
       } catch (e) {
         console.error(`❌ ${connection} reconnection attempt ${this.reconnectAttempts} failed:`, e.message);
       }
     }, delay);
+  }
+
+  // Which connection owns this channel? (prevents duplicate replies & allows secondary to respond)
+  isConnectionForChannel(channelLogin, connection) {
+    const entry = this.channels.get(channelLogin);
+    if (!entry) {
+      // If we don't know yet, prefer primary to avoid dupes.
+      return connection === 'primary';
+    }
+    return !!entry[connection];
   }
 
   // PRODUCTION MESSAGE PROCESSING - Fast decisions with local caching (dual connection support)
@@ -359,14 +377,17 @@ class EloWardTwitchBot {
     const userLogin = event.nick;
     const message = event.message;
 
-    // Fast prefix check for chat commands (only process on primary to avoid duplicates)
-    if (message.startsWith('!eloward') && connection === 'primary') {
+    // Route commands to the connection that actually joined the channel
+    const onThisConn = this.isConnectionForChannel(channelLogin, connection);
+
+    // Handle !eloward* commands
+    if (message.startsWith('!eloward') && onThisConn) {
       console.log(`🎯 Chat command detected: ${userLogin} in ${channelLogin}: ${message}`);
       return this.handleChatCommand(channelLogin, userLogin, message, event);
     }
 
-    // Handle !commands command (separate from !eloward commands)
-    if (message === '!commands' && connection === 'primary') {
+    // Handle !commands (Everyone)
+    if (message === '!commands' && onThisConn) {
       console.log(`🎯 Commands command detected: ${userLogin} in ${channelLogin}`);
       await this.sendChatMessage(channelLogin, `@${userLogin} Full command list: https://www.eloward.com/setup/bot#commands-reference`);
       return;
@@ -666,7 +687,6 @@ class EloWardTwitchBot {
 
   // ---- Role helpers (robust + fast) ----
   parseBadges(badgesStr = '') {
-    // badges come like "broadcaster/1,subscriber/12,moderator/1,vip/1,founder/0"
     return new Set(
       String(badgesStr || '')
         .split(',')
@@ -676,11 +696,36 @@ class EloWardTwitchBot {
   }
 
   getUserRoles(event, channelLogin) {
-    const badges = this.parseBadges(event?.tags?.badges);
-    const isBroadcaster = badges.has('broadcaster/1') || (event?.nick?.toLowerCase() === channelLogin?.toLowerCase());
-    const isModerator  = badges.has('moderator/1') || event?.tags?.mod === '1';
-    const isSubscriber = badges.has('subscriber/1') || badges.has('founder/0') || badges.has('founder/1');
-    const isVip        = badges.has('vip/1');
+    // Parse badges from event tags (now properly populated with IRCv3 capabilities)
+    const badges = this.parseBadges(event?.tags?.badges || '');
+    const nick = (event?.nick || '').toLowerCase();
+    const chan = (channelLogin || '').toLowerCase();
+
+    // Check if user is the broadcaster
+    const isBroadcaster =
+      [...badges].some(b => b.startsWith('broadcaster/')) ||
+      nick === chan;
+
+    // Check moderator status using multiple indicators from Twitch IRC
+    const isModerator =
+      [...badges].some(b => b.startsWith('moderator/')) ||
+      event?.tags?.mod === '1' ||
+      event?.tags?.mod === 1 ||
+      event?.tags?.['user-type'] === 'mod';
+
+    // Check subscriber status (including founders)
+    const isSubscriber =
+      [...badges].some(b => b.startsWith('subscriber/')) ||
+      [...badges].some(b => b.startsWith('founder/')) ||
+      event?.tags?.subscriber === '1' ||
+      event?.tags?.subscriber === 1;
+
+    // Check VIP status
+    const isVip = 
+      [...badges].some(b => b.startsWith('vip/')) ||
+      event?.tags?.vip === '1' ||
+      event?.tags?.vip === 1;
+
     return { isBroadcaster, isModerator, isSubscriber, isVip };
   }
 
