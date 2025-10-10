@@ -694,30 +694,32 @@ class EloWardTwitchBot {
     const mode = (config?.enforcement_mode || 'has_rank').toLowerCase();
     const duration = config?.timeout_seconds || 30;
 
-    // Default reasons by mode
-    let defaultReason;
-    if (mode === 'min_rank') {
-      const tier = (config?.min_rank_tier || '').toUpperCase();
-      const noDivisionTiers = new Set(['MASTER', 'GRANDMASTER', 'CHALLENGER']);
-      const needsDivision = tier && !noDivisionTiers.has(tier);
-      const division = (config?.min_rank_division || '').toUpperCase();
-      if (tier) {
-        defaultReason = `you must be at least ${tier}${needsDivision && division ? ` ${division}` : ''} to type`;
-      } else {
-        defaultReason = 'you must meet the minimum rank to type';
-      }
-    } else {
-      // has_rank (default)
-      defaultReason = 'link your rank, go to eloward.com';
+    // Pick per-mode template from database (no fallbacks - database should always have values)
+    const hasRankTpl = config?.reason_has_rank;
+    const minRankTpl = config?.reason_min_rank;
+    const template = mode === 'min_rank' ? minRankTpl : hasRankTpl;
+
+    // If no template found, this is a configuration error
+    if (!template) {
+      console.error(`❌ No timeout template found for mode ${mode} in config:`, config);
+      return 'Configuration error - please contact the streamer';
     }
 
-    // Allow custom override via reason_template while preserving tokens
-    const template = (config?.reason_template || defaultReason);
+    const minTier = (config?.min_rank_tier || '').toUpperCase();
+    const noDivTiers = new Set(['MASTER', 'GRANDMASTER', 'CHALLENGER']);
+    const div = (config?.min_rank_division || '').toUpperCase();
+    const divisionText = (minTier && !noDivTiers.has(minTier) && div) ? ` ${div}` : '';
 
     return template
       .replace('{seconds}', String(duration))
       .replace('{site}', 'https://eloward.com')
-      .replace('{user}', userLogin);
+      .replace('{user}', userLogin)
+      // support both {} and [] tokens for tier/division
+      .replace('{tier}', minTier)
+      .replace('{division}', divisionText)
+      .replace('[tier]', minTier)
+      .replace('[division]', divisionText)
+    ;
   }
 
   // ---- Role helpers (robust + fast) ----
@@ -1015,14 +1017,22 @@ class EloWardTwitchBot {
           // Join all parts from index 3 onwards to handle multi-word reasons
           const reason = parts.slice(3).join(' ').replace(/"/g, '').trim();
           if (reason) {
-            await this.updateChannelConfig(channelLogin, { reason_template: reason });
-            await this.sendChatMessage(channelLogin, `Timeout reason set to: "${reason}"`);
-            console.log(`⚙️ ${userLogin} set reason to "${reason}" in ${channelLogin}`);
+            // Get current config to determine which mode we're updating
+            const currentConfig = await this.getCurrentConfig(channelLogin);
+            const mode = currentConfig?.enforcement_mode || 'has_rank';
+            
+            // Update the appropriate mode-specific column
+            const updateField = mode === 'min_rank' ? 'reason_min_rank' : 'reason_has_rank';
+            await this.updateChannelConfig(channelLogin, { [updateField]: reason });
+            
+            const modeText = mode === 'min_rank' ? 'min_rank mode' : 'has_rank mode';
+            await this.sendChatMessage(channelLogin, `Timeout reason for ${modeText} set to: "${reason}"`);
+            console.log(`⚙️ ${userLogin} set ${updateField} to "${reason}" in ${channelLogin}`);
           } else {
             await this.sendChatMessage(channelLogin, `Please provide a reason message`);
           }
         } else {
-          await this.sendChatMessage(channelLogin, `Usage: !eloward set reason [your custom message]`);
+          await this.sendChatMessage(channelLogin, `Usage: !eloward set reason [your custom message] (updates current mode's timeout message)`);
         }
         break;
 
