@@ -24,6 +24,7 @@ class EloWardTwitchBot {
     this.configCache = new Map(); // channel -> {config, expires}  
     this.rankCache = new Map();   // user -> {hasRank, expires}
     this.expectedChannels = new Set(); // Track channels we should be in - MUST be initialized!
+    this.existingChannels = new Set(); // Track channels to detect new ones for auto-follow
     
     // Super admin hard-whitelist (case-insensitive)
     this.superAdmins = new Set(['yomata1']);
@@ -283,6 +284,11 @@ class EloWardTwitchBot {
       console.log('🔧 Requesting Twitch IRCv3 capabilities for primary connection...');
       this.primaryBot.raw('CAP REQ :twitch.tv/tags twitch.tv/commands twitch.tv/membership');
       
+      // Wire up NOTICE logging for primary connection (catches Twitch rejections)
+      this.primaryBot.on('notice', (ev) => {
+        console.warn(`📣 NOTICE [primary] in ${ev.target || 'server'}: ${ev.message}`);
+      });
+      
       // Always load channels after connection
       await this.loadChannels();
     });
@@ -298,6 +304,11 @@ class EloWardTwitchBot {
       // Request Twitch-specific IRCv3 capabilities for tags, commands, and membership
       console.log('🔧 Requesting Twitch IRCv3 capabilities for secondary connection...');
       this.secondaryBot.raw('CAP REQ :twitch.tv/tags twitch.tv/commands twitch.tv/membership');
+      
+      // Wire up NOTICE logging for secondary connection (catches Twitch rejections)
+      this.secondaryBot.on('notice', (ev) => {
+        console.warn(`📣 NOTICE [secondary] in ${ev.target || 'server'}: ${ev.message}`);
+      });
       
       // Restore secondary channels after reconnection (only if expectedChannels is populated)
       if (this.expectedChannels && this.expectedChannels.size > this.maxChannelsPerConnection) {
@@ -371,6 +382,15 @@ class EloWardTwitchBot {
       return connection === 'primary';
     }
     return !!entry[connection];
+  }
+
+  // Helper: pick the correct IRC client for a channel
+  getClientForChannel(channelLogin) {
+    const entry = this.channels.get(channelLogin);
+    if (entry?.primary) return this.primaryBot;
+    if (entry?.secondary) return this.secondaryBot;
+    // Fallback: if we don't have an entry yet, prefer primary
+    return this.primaryBot;
   }
 
   // PRODUCTION MESSAGE PROCESSING - Fast decisions with local caching (dual connection support)
@@ -669,12 +689,50 @@ class EloWardTwitchBot {
     }
   }
 
-  // Send message to chat channel
+  // Automatically follow a channel via Worker (HMAC-secured)
+  async followChannel(channelLogin) {
+    try {
+      const path = '/bot/follow-channel';
+      const body = JSON.stringify({ channel_login: channelLogin });
+      const headers = this.signRequest('POST', path, body);
+      
+      const response = await fetch(`${this.WORKER_URL}${path}`, {
+        method: 'POST',
+        headers,
+        body
+      });
+
+      if (response.ok) {
+        console.log(`✅ Bot now following ${channelLogin}`);
+        return true;
+      } else {
+        const errorData = await response.text();
+        console.warn(`⚠️ Follow failed for ${channelLogin} (${response.status}): ${errorData}`);
+        return false;
+      }
+    } catch (error) {
+      console.warn(`⚠️ Follow error for ${channelLogin}:`, error.message);
+      return false;
+    }
+  }
+
+  // Send message to chat channel on the correct connection
   async sendChatMessage(channelLogin, message) {
     try {
-      // Send on primary connection to avoid duplicates
-      this.primaryBot.say(`#${channelLogin}`, message);
-      console.log(`💬 Sent to #${channelLogin}: ${message}`);
+      const client = this.getClientForChannel(channelLogin);
+      const entry = this.channels.get(channelLogin);
+      
+      // Safety: if we somehow aren't joined, join on primary and mark map
+      if (!entry?.primary && !entry?.secondary) {
+        console.warn(`⚠️ Not joined to #${channelLogin}, joining on primary...`);
+        this.primaryBot.join(`#${channelLogin}`);
+        this.channels.set(channelLogin, { primary: true, secondary: false });
+        await new Promise(r => setTimeout(r, 300)); // Brief delay for join
+      }
+      
+      client.say(`#${channelLogin}`, message);
+      const connLabel = (entry?.primary && 'primary') || (entry?.secondary && 'secondary') || 'unknown';
+      console.log(`💬 [${connLabel}] Sent to #${channelLogin}: ${message}`);
     } catch (error) {
       console.error(`❌ Failed to send message to #${channelLogin}:`, error.message);
     }
@@ -1086,6 +1144,13 @@ class EloWardTwitchBot {
       this.expectedChannels.clear();
       channels.forEach(channel => this.expectedChannels.add(channel));
       
+      // Track existing channels on FIRST load (for follow detection)
+      const isFirstLoad = this.existingChannels.size === 0;
+      if (isFirstLoad) {
+        console.log('🆕 First load - marking all channels as existing (skip auto-follow)');
+        channels.forEach(channel => this.existingChannels.add(channel));
+      }
+      
       // Clear and rebuild channel map
       this.channels.clear();
       
@@ -1095,11 +1160,23 @@ class EloWardTwitchBot {
       
       console.log(`🎯 Joining ${primaryChannels.length} channels on primary connection...`);
       
-      // Join channels on primary connection with rate limiting
+      // Join channels on primary connection with rate limiting + auto-follow
       for (let i = 0; i < primaryChannels.length; i++) {
         const channel = primaryChannels[i];
+        
+        // Track if this is a new channel (not previously joined)
+        const wasAlreadyJoined = this.channels.has(channel);
+        
         this.primaryBot.join(`#${channel}`);
         this.channels.set(channel, { primary: true, secondary: false });
+        
+        // Only follow NEW channels (skip existing ones to avoid re-following)
+        const shouldFollow = !isFirstLoad && !this.existingChannels.has(channel);
+        if (shouldFollow) {
+          console.log(`👥 New channel detected: ${channel}, auto-following...`);
+          await this.followChannel(channel);
+          this.existingChannels.add(channel); // Mark as known
+        }
         
         // Conservative rate limit: 15 joins per 10 seconds = 667ms between joins
         await new Promise(resolve => setTimeout(resolve, 667));
@@ -1113,11 +1190,22 @@ class EloWardTwitchBot {
       if (secondaryChannels.length > 0) {
         console.log(`🎯 Joining ${secondaryChannels.length} channels on secondary connection...`);
         
-        // Join channels on secondary connection with rate limiting
+        // Join channels on secondary connection with rate limiting + auto-follow
         for (let i = 0; i < secondaryChannels.length; i++) {
           const channel = secondaryChannels[i];
+          
+          const wasAlreadyJoined = this.channels.has(channel);
+          
           this.secondaryBot.join(`#${channel}`);
           this.channels.set(channel, { primary: false, secondary: true });
+          
+          // Only follow NEW channels
+          const shouldFollow = !isFirstLoad && !this.existingChannels.has(channel);
+          if (shouldFollow) {
+            console.log(`👥 New channel detected: ${channel}, auto-following...`);
+            await this.followChannel(channel);
+            this.existingChannels.add(channel); // Mark as known
+          }
           
           await new Promise(resolve => setTimeout(resolve, 667));
           
