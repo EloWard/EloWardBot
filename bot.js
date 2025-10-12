@@ -1247,15 +1247,50 @@ class EloWardTwitchBot {
             console.log('⚡ Redis config update:', data.type, data.channel_login);
             
             if (data.type === 'config_update' && data.channel_login) {
-              // Invalidate cache for instant effect - bot stays in channel, just changes mode
-              const hadCache = this.configCache.has(data.channel_login);
-              this.configCache.delete(data.channel_login);
-              console.log(`🗑️  Cache invalidated for ${data.channel_login} (had cache: ${hadCache}, fields: ${JSON.stringify(data.fields)})`);
+              const channelLogin = data.channel_login;
               
-              // Log mode change but DON'T reload channels - bot stays joined 24/7
-              if (data.fields?.bot_enabled !== undefined) {
-                const mode = data.fields.bot_enabled ? 'Enforcing' : 'Standby';
-                console.log(`⚡ Mode changed for ${data.channel_login}: ${mode} (bot remains in channel)`);
+              // Always invalidate cache for instant config propagation
+              this.configCache.delete(channelLogin);
+              console.log(`🗑️ Cache invalidated for ${channelLogin}`);
+              
+              // CHECK: Are we already in this channel?
+              if (!this.channels.has(channelLogin)) {
+                console.log(`🆕 Not in ${channelLogin} yet - joining immediately!`);
+                
+                // Add to expected channels set
+                this.expectedChannels.add(channelLogin);
+                
+                // Determine which connection to use based on current load
+                const primaryCount = Array.from(this.channels.values()).filter(c => c.primary).length;
+                const secondaryCount = Array.from(this.channels.values()).filter(c => c.secondary).length;
+                
+                // Use primary if it has space and isn't more loaded than secondary
+                if (primaryCount < this.maxChannelsPerConnection && primaryCount <= secondaryCount) {
+                  console.log(`📍 Joining ${channelLogin} on PRIMARY (${primaryCount + 1}/${this.maxChannelsPerConnection})`);
+                  this.primaryBot.join(`#${channelLogin}`);
+                  this.channels.set(channelLogin, { primary: true, secondary: false });
+                } else if (secondaryCount < this.maxChannelsPerConnection) {
+                  console.log(`📍 Joining ${channelLogin} on SECONDARY (${secondaryCount + 1}/${this.maxChannelsPerConnection})`);
+                  this.secondaryBot.join(`#${channelLogin}`);
+                  this.channels.set(channelLogin, { primary: false, secondary: true });
+                } else {
+                  console.warn(`⚠️ Both connections at capacity, ${channelLogin} will join on next sync`);
+                }
+                
+                // Auto-follow if not first load
+                if (this.existingChannels.size > 0 && !this.existingChannels.has(channelLogin)) {
+                  console.log(`👥 Auto-following: ${channelLogin}`);
+                  await this.followChannel(channelLogin);
+                  this.existingChannels.add(channelLogin);
+                }
+              } else {
+                // We're already in this channel, just log the config change
+                if (data.fields?.bot_enabled !== undefined) {
+                  const mode = data.fields.bot_enabled ? 'Enforcing' : 'Standby';
+                  console.log(`⚡ Mode changed for ${channelLogin}: ${mode}`);
+                } else {
+                  console.log(`⚙️ Config updated for ${channelLogin}:`, Object.keys(data.fields));
+                }
               }
             }
           } catch (error) {
