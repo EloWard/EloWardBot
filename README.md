@@ -61,6 +61,8 @@ EloWardBot creates a funnel to drive Twitch viewers to connect their League of L
 
 This solves the "chicken and egg" problem where users couldn't enable the bot because it wasn't in their channel.
 
+**Note**: Auto-follow functionality was removed due to Twitch's deprecation of programmatic follow/unfollow API endpoints on July 27, 2021. Users must manually follow channels through the Twitch interface.
+
 ## 🔧 **Core Components**
 
 ### **1. IRC Bot (AWS ECS Fargate)**
@@ -201,6 +203,8 @@ Dashboard/Chat → Worker (/bot/config:update) → D1 Write → Redis Publish �
 - `channel:moderate` - For mod/broadcaster context
 - If we also delete messages, add `moderator:manage:chat_messages`
 - Respect Twitch Helix rate buckets (per-user/app); on `429`, use exponential backoff + jitter
+
+**Note**: `user:edit:follows` scope was removed as Twitch deprecated programmatic follow/unfollow API on July 27, 2021.
 
 **Self-Healing**:
 - Every 60-120s: lightweight reconcile sweep (check `updated_at` for stale cache)

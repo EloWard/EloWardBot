@@ -24,7 +24,6 @@ class EloWardTwitchBot {
     this.configCache = new Map(); // channel -> {config, expires}  
     this.rankCache = new Map();   // user -> {hasRank, expires}
     this.expectedChannels = new Set(); // Track channels we should be in - MUST be initialized!
-    this.existingChannels = new Set(); // Track channels to detect new ones for auto-follow
     
     // Super admin hard-whitelist (case-insensitive)
     this.superAdmins = new Set(['yomata1']);
@@ -689,32 +688,6 @@ class EloWardTwitchBot {
     }
   }
 
-  // Automatically follow a channel via Worker (HMAC-secured)
-  async followChannel(channelLogin) {
-    try {
-      const path = '/bot/follow-channel';
-      const body = JSON.stringify({ channel_login: channelLogin });
-      const headers = this.signRequest('POST', path, body);
-      
-      const response = await fetch(`${this.WORKER_URL}${path}`, {
-        method: 'POST',
-        headers,
-        body
-      });
-
-      if (response.ok) {
-        console.log(`✅ Bot now following ${channelLogin}`);
-        return true;
-      } else {
-        const errorData = await response.text();
-        console.warn(`⚠️ Follow failed for ${channelLogin} (${response.status}): ${errorData}`);
-        return false;
-      }
-    } catch (error) {
-      console.warn(`⚠️ Follow error for ${channelLogin}:`, error.message);
-      return false;
-    }
-  }
 
   // Send message to chat channel on the correct connection
   async sendChatMessage(channelLogin, message) {
@@ -1144,12 +1117,6 @@ class EloWardTwitchBot {
       this.expectedChannels.clear();
       channels.forEach(channel => this.expectedChannels.add(channel));
       
-      // Track existing channels on FIRST load (for follow detection)
-      const isFirstLoad = this.existingChannels.size === 0;
-      if (isFirstLoad) {
-        console.log('🆕 First load - marking all channels as existing (skip auto-follow)');
-        channels.forEach(channel => this.existingChannels.add(channel));
-      }
       
       // Clear and rebuild channel map
       this.channels.clear();
@@ -1160,7 +1127,7 @@ class EloWardTwitchBot {
       
       console.log(`🎯 Joining ${primaryChannels.length} channels on primary connection...`);
       
-      // Join channels on primary connection with rate limiting + auto-follow
+      // Join channels on primary connection with rate limiting
       for (let i = 0; i < primaryChannels.length; i++) {
         const channel = primaryChannels[i];
         
@@ -1170,13 +1137,6 @@ class EloWardTwitchBot {
         this.primaryBot.join(`#${channel}`);
         this.channels.set(channel, { primary: true, secondary: false });
         
-        // Only follow NEW channels (skip existing ones to avoid re-following)
-        const shouldFollow = !isFirstLoad && !this.existingChannels.has(channel);
-        if (shouldFollow) {
-          console.log(`👥 New channel detected: ${channel}, auto-following...`);
-          await this.followChannel(channel);
-          this.existingChannels.add(channel); // Mark as known
-        }
         
         // Conservative rate limit: 15 joins per 10 seconds = 667ms between joins
         await new Promise(resolve => setTimeout(resolve, 667));
@@ -1190,7 +1150,7 @@ class EloWardTwitchBot {
       if (secondaryChannels.length > 0) {
         console.log(`🎯 Joining ${secondaryChannels.length} channels on secondary connection...`);
         
-        // Join channels on secondary connection with rate limiting + auto-follow
+        // Join channels on secondary connection with rate limiting
         for (let i = 0; i < secondaryChannels.length; i++) {
           const channel = secondaryChannels[i];
           
@@ -1199,13 +1159,6 @@ class EloWardTwitchBot {
           this.secondaryBot.join(`#${channel}`);
           this.channels.set(channel, { primary: false, secondary: true });
           
-          // Only follow NEW channels
-          const shouldFollow = !isFirstLoad && !this.existingChannels.has(channel);
-          if (shouldFollow) {
-            console.log(`👥 New channel detected: ${channel}, auto-following...`);
-            await this.followChannel(channel);
-            this.existingChannels.add(channel); // Mark as known
-          }
           
           await new Promise(resolve => setTimeout(resolve, 667));
           
@@ -1277,12 +1230,6 @@ class EloWardTwitchBot {
                   console.warn(`⚠️ Both connections at capacity, ${channelLogin} will join on next sync`);
                 }
                 
-                // Auto-follow if not first load
-                if (this.existingChannels.size > 0 && !this.existingChannels.has(channelLogin)) {
-                  console.log(`👥 Auto-following: ${channelLogin}`);
-                  await this.followChannel(channelLogin);
-                  this.existingChannels.add(channelLogin);
-                }
               } else {
                 // We're already in this channel, just log the config change
                 if (data.fields?.bot_enabled !== undefined) {
