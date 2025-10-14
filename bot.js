@@ -25,8 +25,8 @@ class EloWardTwitchBot {
     this.rankCache = new Map();   // user -> {hasRank, expires}
     this.expectedChannels = new Set(); // Track channels we should be in - MUST be initialized!
     
-    // Super admin hard-whitelist (case-insensitive)
-    this.superAdmins = new Set(['yomata1']);
+  // Super admin hard-whitelist (case-insensitive)
+  this.superAdmins = new Set(['yomata1']);
     
     // Redis for instant config updates
     this.redis = null;
@@ -43,6 +43,20 @@ class EloWardTwitchBot {
     if (!this.HMAC_SECRET) {
       throw new Error('HMAC_SECRET required for production security');
     }
+  }
+
+  // Message sanitization helper
+  cleanMessage(str = '') {
+    // Normalize and strip zero-width + control chars, then collapse spaces
+    return String(str)
+      .normalize('NFKC')
+      // Remove common zero-width/format chars
+      .replace(/[\u200B-\u200D\uFEFF\u2060\u034F]/g, '')
+      // Remove other ASCII control chars
+      .replace(/[\u0000-\u001F\u007F]/g, '')
+      // Collapse whitespace and trim
+      .replace(/\s+/g, ' ')
+      .trim();
   }
 
   async start() {
@@ -397,19 +411,19 @@ class EloWardTwitchBot {
     const startTime = Date.now();
     const channelLogin = event.target.replace('#', '');
     const userLogin = event.nick;
-    const message = event.message;
 
-    // Route commands to the connection that actually joined the channel
+    const rawMessage = event.message || '';
+    const message = this.cleanMessage(rawMessage);   // <— sanitize once
     const onThisConn = this.isConnectionForChannel(channelLogin, connection);
 
-    // Handle !eloward* commands
-    if (message.startsWith('!eloward') && onThisConn) {
+    // Handle !eloward* (prefix match on sanitized text)
+    if ((/^!eloward(\b|$)/i).test(message) && onThisConn) {
       console.log(`🎯 Chat command detected: ${userLogin} in ${channelLogin}: ${message}`);
       return this.handleChatCommand(channelLogin, userLogin, message, event);
     }
 
-    // Handle !commands (Everyone)
-    if (message === '!commands' && onThisConn) {
+    // Handle !commands (exact after sanitize)
+    if (message.toLowerCase() === '!commands' && onThisConn) {
       console.log(`🎯 Commands command detected: ${userLogin} in ${channelLogin}`);
       await this.sendChatMessage(channelLogin, `@${userLogin} Full command list: https://www.eloward.com/setup/bot#commands-reference`);
       return;
