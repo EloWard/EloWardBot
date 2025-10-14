@@ -24,6 +24,10 @@ class EloWardTwitchBot {
     this.configCache = new Map(); // channel -> {config, expires}  
     this.rankCache = new Map();   // user -> {hasRank, expires}
     this.expectedChannels = new Set(); // Track channels we should be in - MUST be initialized!
+    // Presence tracking (real membership per connection)
+    this.joined = { primary: new Set(), secondary: new Set() };
+    this.bannedOrRejected = new Set();
+    this.initialLoadDone = false;
     
   // Super admin hard-whitelist (case-insensitive)
   this.superAdmins = new Set(['yomata1']);
@@ -87,6 +91,8 @@ class EloWardTwitchBot {
     this.startTokenMonitoring();
     this.startRedisSubscription();
     this.startConfigSweep();
+    this.startChannelWatchdog();
+    this.startChannelRosterRefresh();
   }
 
   // HMAC request signing for secure Worker communication
@@ -288,6 +294,45 @@ class EloWardTwitchBot {
   }
 
   setupEventHandlers() {
+    const wirePresenceHandlers = (client, label) => {
+      client.on('join', (ev) => {
+        const ch = ev.channel?.replace('#','').toLowerCase();
+        const nick = (ev.nick || '').toLowerCase();
+        if (!ch || nick !== 'elowardbot') return;
+        (label === 'primary' ? this.joined.primary : this.joined.secondary).add(ch);
+        const cur = this.channels.get(ch) || { primary:false, secondary:false };
+        this.channels.set(ch, label === 'primary' ? { ...cur, primary:true } : { ...cur, secondary:true });
+      });
+
+      client.on('part', (ev) => {
+        const ch = ev.channel?.replace('#','').toLowerCase();
+        const nick = (ev.nick || '').toLowerCase();
+        if (!ch || nick !== 'elowardbot') return;
+        (label === 'primary' ? this.joined.primary : this.joined.secondary).delete(ch);
+        // If the channel is expected and not banned, nudge a rejoin with jitter
+        if (this.expectedChannels.has(ch) && !this.bannedOrRejected.has(ch)) {
+          setTimeout(() => { try { client.join(`#${ch}`); } catch(_) {} }, 500 + Math.floor(Math.random()*1500));
+        }
+      });
+
+      client.on('notice', (ev) => {
+        const ch = (ev.target || '').replace('#','').toLowerCase();
+        const msg = (ev.message || '').toLowerCase();
+        if (!ch) return;
+        if (msg.includes('banned from this channel') ||
+            msg.includes('not allowed') ||
+            msg.includes('requires verified') ||
+            msg.includes('authentication failed')) {
+          this.bannedOrRejected.add(ch);
+          this.joined.primary.delete(ch);
+          this.joined.secondary.delete(ch);
+          const cur = this.channels.get(ch) || { primary:false, secondary:false };
+          this.channels.set(ch, { ...cur, primary:false, secondary:false });
+          console.warn(`🚫 Won't rejoin #${ch} (NOTICE: ${ev.message})`);
+        }
+      });
+    };
+
     // Primary connection event handlers
     this.primaryBot.on('registered', async () => {
       console.log('✅ Primary IRC connection established!');
@@ -302,9 +347,20 @@ class EloWardTwitchBot {
         console.warn(`📣 NOTICE [primary] in ${ev.target || 'server'}: ${ev.message}`);
       });
       
-      // Always load channels after connection
-      await this.loadChannels();
+      // On first connect load roster; on reconnect just restore owned channels
+      if (!this.initialLoadDone) {
+        await this.loadChannels();
+        this.initialLoadDone = true;
+      } else {
+        const toJoin = [];
+        for (const [channel, own] of this.channels.entries()) {
+          if (own.primary && !this.bannedOrRejected.has(channel)) toJoin.push(channel);
+        }
+        console.log(`🔄 Restoring ${toJoin.length} channels on PRIMARY...`);
+        for (const ch of toJoin) { this.primaryBot.join(`#${ch}`); await new Promise(r => setTimeout(r, 667)); }
+      }
     });
+    wirePresenceHandlers(this.primaryBot, 'primary');
 
     this.primaryBot.on('privmsg', (event) => this.handleMessage(event, 'primary'));
     this.primaryBot.on('error', (err) => this.handleConnectionError(err, 'primary'));
@@ -323,20 +379,15 @@ class EloWardTwitchBot {
         console.warn(`📣 NOTICE [secondary] in ${ev.target || 'server'}: ${ev.message}`);
       });
       
-      // Restore secondary channels after reconnection (only if expectedChannels is populated)
-      if (this.expectedChannels && this.expectedChannels.size > this.maxChannelsPerConnection) {
-        const allChannels = Array.from(this.expectedChannels);
-        const secondaryChannels = allChannels.slice(this.maxChannelsPerConnection);
-        
-        console.log(`🔄 Restoring ${secondaryChannels.length} channels on secondary connection...`);
-        for (const channel of secondaryChannels) {
-          this.secondaryBot.join(`#${channel}`);
-          const existing = this.channels.get(channel) || { primary: false, secondary: false };
-          this.channels.set(channel, { ...existing, secondary: true });
-          await new Promise(resolve => setTimeout(resolve, 667)); // Rate limit
-        }
+      // Always restore channels owned by secondary (no size threshold)
+      const toJoin = [];
+      for (const [channel, own] of this.channels.entries()) {
+        if (own.secondary && !this.bannedOrRejected.has(channel)) toJoin.push(channel);
       }
+      console.log(`🔄 Restoring ${toJoin.length} channels on SECONDARY...`);
+      for (const ch of toJoin) { this.secondaryBot.join(`#${ch}`); await new Promise(r => setTimeout(r, 667)); }
     });
+    wirePresenceHandlers(this.secondaryBot, 'secondary');
 
     this.secondaryBot.on('privmsg', (event) => this.handleMessage(event, 'secondary'));
     this.secondaryBot.on('error', (err) => this.handleConnectionError(err, 'secondary'));
@@ -706,14 +757,19 @@ class EloWardTwitchBot {
   // Send message to chat channel on the correct connection
   async sendChatMessage(channelLogin, message) {
     try {
-      const client = this.getClientForChannel(channelLogin);
       const entry = this.channels.get(channelLogin);
+      const client = this.getClientForChannel(channelLogin);
       
-      // Safety: if we somehow aren't joined, join on primary and mark map
-      if (!entry?.primary && !entry?.secondary) {
+      // Safety: if we somehow aren't joined anywhere, join on the chosen owner
+      const joinedSomewhere = this.joined.primary.has(channelLogin) || this.joined.secondary.has(channelLogin);
+      if (!joinedSomewhere) {
         console.warn(`⚠️ Not joined to #${channelLogin}, joining on primary...`);
-        this.primaryBot.join(`#${channelLogin}`);
-        this.channels.set(channelLogin, { primary: true, secondary: false });
+        if (entry?.secondary) {
+          this.secondaryBot.join(`#${channelLogin}`);
+        } else {
+          this.primaryBot.join(`#${channelLogin}`);
+          if (!entry) this.channels.set(channelLogin, { primary:true, secondary:false });
+        }
         await new Promise(r => setTimeout(r, 300)); // Brief delay for join
       }
       
@@ -1274,7 +1330,31 @@ class EloWardTwitchBot {
     });
   }
 
-  // Self-healing config sweep (every 60-120s)
+  startChannelWatchdog() {
+    const tick = async () => {
+      try {
+        for (const ch of this.expectedChannels) {
+          if (this.bannedOrRejected.has(ch)) continue;
+          const own = this.channels.get(ch);
+          if (!own || (!own.primary && !own.secondary)) {
+            // Assign to the lighter connection (simple balance)
+            const p = this.joined.primary.size, s = this.joined.secondary.size;
+            if (p < this.maxChannelsPerConnection && p <= s) this.channels.set(ch, { primary:true, secondary:false });
+            else if (s < this.maxChannelsPerConnection) this.channels.set(ch, { primary:false, secondary:true });
+            else continue;
+          }
+          const owner = this.channels.get(ch);
+          if (owner.primary && !this.joined.primary.has(ch)) { this.primaryBot.join(`#${ch}`); await new Promise(r => setTimeout(r, 300)); }
+          else if (owner.secondary && !this.joined.secondary.has(ch)) { this.secondaryBot.join(`#${ch}`); await new Promise(r => setTimeout(r, 300)); }
+        }
+      } catch (e) {
+        console.warn('Watchdog tick error:', e.message);
+      } finally {
+        setTimeout(tick, 20_000 + Math.floor(Math.random()*10_000));
+      }
+    };
+    tick();
+  }
   startConfigSweep() {
     const sweepInterval = 90000 + Math.random() * 30000; // 90-120s with jitter
     
@@ -1294,6 +1374,22 @@ class EloWardTwitchBot {
     }, sweepInterval);
     
     console.log(`🧹 Config sweep started (${Math.round(sweepInterval/1000)}s interval)`);
+  }
+
+  startChannelRosterRefresh() {
+    const refresh = async () => {
+      try {
+        const resp = await fetch(`${this.WORKER_URL}/channels`);
+        if (resp.ok) {
+          const { channels } = await resp.json();
+          const next = new Set(channels.map(c => c.toLowerCase()));
+          for (const ch of next) this.expectedChannels.add(ch);
+          for (const ch of [...this.expectedChannels]) if (!next.has(ch)) this.expectedChannels.delete(ch);
+        }
+      } catch(_) {}
+      setTimeout(refresh, 5 * 60 * 1000);
+    };
+    refresh();
   }
 }
 
