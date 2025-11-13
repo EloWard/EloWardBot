@@ -1268,25 +1268,57 @@ class EloWardTwitchBot {
           try {
             const data = JSON.parse(message);
             console.log('⚡ Redis config update:', data.type, data.channel_login);
-            
+
             if (data.type === 'config_update' && data.channel_login) {
               const channelLogin = data.channel_login;
-              
+
+              // Check for disconnect action first
+              if (data.fields?.action === 'disconnect') {
+                console.log(`🚪 Disconnect requested for ${channelLogin} - leaving channel permanently`);
+
+                // Remove from expected channels set
+                this.expectedChannels.delete(channelLogin);
+
+                // Clear all caches for this channel
+                this.configCache.delete(channelLogin);
+
+                // Leave the channel on both connections (if present)
+                const channelEntry = this.channels.get(channelLogin);
+                if (channelEntry) {
+                  if (channelEntry.primary) {
+                    this.primaryBot.part(`#${channelLogin}`);
+                    this.joined.primary.delete(channelLogin);
+                    console.log(`👋 Left ${channelLogin} on PRIMARY connection`);
+                  }
+                  if (channelEntry.secondary) {
+                    this.secondaryBot.part(`#${channelLogin}`);
+                    this.joined.secondary.delete(channelLogin);
+                    console.log(`👋 Left ${channelLogin} on SECONDARY connection`);
+                  }
+
+                  // Remove from channels map
+                  this.channels.delete(channelLogin);
+                }
+
+                console.log(`✅ Disconnected from ${channelLogin} - bot will not rejoin`);
+                return;
+              }
+
               // Always invalidate cache for instant config propagation
               this.configCache.delete(channelLogin);
               console.log(`🗑️ Cache invalidated for ${channelLogin}`);
-              
+
               // CHECK: Are we already in this channel?
               if (!this.channels.has(channelLogin)) {
                 console.log(`🆕 Not in ${channelLogin} yet - joining immediately!`);
-                
+
                 // Add to expected channels set
                 this.expectedChannels.add(channelLogin);
-                
+
                 // Determine which connection to use based on current load
                 const primaryCount = Array.from(this.channels.values()).filter(c => c.primary).length;
                 const secondaryCount = Array.from(this.channels.values()).filter(c => c.secondary).length;
-                
+
                 // Use primary if it has space and isn't more loaded than secondary
                 if (primaryCount < this.maxChannelsPerConnection && primaryCount <= secondaryCount) {
                   console.log(`📍 Joining ${channelLogin} on PRIMARY (${primaryCount + 1}/${this.maxChannelsPerConnection})`);
@@ -1299,7 +1331,7 @@ class EloWardTwitchBot {
                 } else {
                   console.warn(`⚠️ Both connections at capacity, ${channelLogin} will join on next sync`);
                 }
-                
+
               } else {
                 // We're already in this channel, just log the config change
                 if (data.fields?.bot_enabled !== undefined) {
